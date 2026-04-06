@@ -425,15 +425,44 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
         script_lines = parse_source_script(script_path)
         log(f"✓ Found {len(script_lines)} lines in script.", 15)
 
-        # 2 — Extract audio
-        log("Extracting audio from video (ffmpeg)…", 20)
-        wav  = tmp_dir / "audio.wav"
-        mp3  = tmp_dir / "audio.mp3"
-        extract_audio(video_path, wav)
-        log("Compressing audio for upload…", 30)
-        compress_audio(wav, mp3)
-        size_mb = mp3.stat().st_size / 1024 / 1024
-        log(f"Audio ready — {size_mb:.1f} MB", 35)
+        # 2 — Audio: extract from video, or use directly if already audio
+        AUDIO_EXTS = {".mp3", ".mp4a", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
+        VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".avi", ".mkv", ".mts", ".m2ts"}
+        upload_ext = Path(video_path).suffix.lower()
+
+        mp3 = tmp_dir / "audio.mp3"
+
+        if upload_ext in AUDIO_EXTS and upload_ext == ".mp3":
+            # Already an MP3 — check size and use directly
+            size_mb = Path(video_path).stat().st_size / 1024 / 1024
+            log(f"Audio file detected ({size_mb:.1f} MB) — skipping extraction…", 20)
+            if size_mb > 24:
+                # Still too big — re-compress at lower bitrate
+                log("File over 25 MB — re-compressing…", 25)
+                compress_audio(video_path, mp3)
+            else:
+                import shutil as _sh
+                _sh.copy2(video_path, mp3)
+            size_mb = mp3.stat().st_size / 1024 / 1024
+            log(f"✓ Audio ready — {size_mb:.1f} MB", 35)
+
+        elif upload_ext in AUDIO_EXTS:
+            # Other audio format — just compress/convert to MP3
+            size_mb = Path(video_path).stat().st_size / 1024 / 1024
+            log(f"Audio file detected ({upload_ext}, {size_mb:.1f} MB) — converting to MP3…", 20)
+            compress_audio(video_path, mp3)
+            size_mb = mp3.stat().st_size / 1024 / 1024
+            log(f"✓ Audio ready — {size_mb:.1f} MB", 35)
+
+        else:
+            # Video file — extract then compress as before
+            log("Extracting audio from video (ffmpeg)…", 20)
+            wav = tmp_dir / "audio.wav"
+            extract_audio(video_path, wav)
+            log("Compressing audio for upload…", 30)
+            compress_audio(wav, mp3)
+            size_mb = mp3.stat().st_size / 1024 / 1024
+            log(f"✓ Audio ready — {size_mb:.1f} MB", 35)
 
         # 3 — Transcribe
         log("Sending to OpenAI Whisper API…", 40)
@@ -559,3 +588,4 @@ def download(job_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
+
