@@ -501,62 +501,88 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
 # Flask routes
 # ─────────────────────────────────────────────────────────────────────────────
 
+import csv
+from datetime import datetime, timezone
+
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pp_timecoder_uploads"
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "pp_timecoder_outputs"
+LOG_FILE   = Path(tempfile.gettempdir()) / "pp_timecoder_usage.csv"
 UPLOAD_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
+
+PERMANENT_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+
+
+def write_usage_log(user_name, script_filename, video_filename, status, note=""):
+    is_new = not LOG_FILE.exists()
+    try:
+        with open(LOG_FILE, "a", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            if is_new:
+                w.writerow(["timestamp_utc", "user_name", "script_file", "video_file", "status", "note"])
+            w.writerow([
+                datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                user_name or "unknown",
+                script_filename, video_filename, status, note,
+            ])
+    except Exception as e:
+        print(f"Usage log write failed: {e}")
 
 
 @app.route("/")
 def index():
-    return render_template("index.html")
+    return render_template("index.html", has_permanent_key=bool(PERMANENT_API_KEY))
 
 
 @app.route("/api/start", methods=["POST"])
 def start_job():
-    # Validate files
     if "script" not in request.files or "video" not in request.files:
         return jsonify({"error": "Both script and video files are required."}), 400
 
     script_file = request.files["script"]
     video_file  = request.files["video"]
-    api_key     = request.form.get("api_key", "").strip()
+    user_name   = request.form.get("user_name", "").strip()
     tc_offset   = request.form.get("tc_offset", "10:00:00:00").strip()
     fps         = float(request.form.get("fps", "25"))
 
-    if not api_key:
-        return jsonify({"error": "OpenAI API key is required."}), 400
+    if PERMANENT_API_KEY:
+        api_key = PERMANENT_API_KEY
+    else:
+        api_key = request.form.get("api_key", "").strip()
+        if not api_key:
+            return jsonify({"error": "OpenAI API key is required."}), 400
+        if not api_key.startswith("sk-"):
+            return jsonify({"error": "That does not look like a valid OpenAI API key."}), 400
 
-    if not api_key.startswith("sk-"):
-        return jsonify({"error": "That doesn't look like a valid OpenAI API key (should start with sk-)."}), 400
+    if not user_name:
+        return jsonify({"error": "Please enter your name so we can track usage."}), 400
 
-    # Save uploaded files
-    job_id = str(uuid.uuid4())
+    job_id      = str(uuid.uuid4())
     script_path = UPLOAD_DIR / f"{job_id}_script.docx"
     video_path  = UPLOAD_DIR / f"{job_id}_video{Path(video_file.filename).suffix}"
     output_path = OUTPUT_DIR / f"{job_id}_timecoded.docx"
 
     script_file.save(str(script_path))
     video_file.save(str(video_path))
+    write_usage_log(user_name, script_file.filename, video_file.filename, "started")
 
-    # Init job
     jobs[job_id] = {
         "status":      "running",
         "progress":    0,
         "log":         [],
         "output_path": None,
         "error":       None,
+        "user_name":   user_name,
+        "script_name": script_file.filename,
+        "video_name":  video_file.filename,
     }
 
-    # Run in background
     thread = threading.Thread(
         target=run_job,
-        args=(job_id, str(script_path), str(video_path),
-              tc_offset, fps, api_key, output_path),
+        args=(job_id, str(script_path), str(video_path), tc_offset, fps, api_key, output_path),
         daemon=True
     )
     thread.start()
-
     return jsonify({"job_id": job_id})
 
 
@@ -565,12 +591,15 @@ def job_status(job_id):
     job = jobs.get(job_id)
     if not job:
         return jsonify({"error": "Job not found"}), 404
-    return jsonify({
-        "status":   job["status"],
-        "progress": job["progress"],
-        "log":      job["log"],
-        "error":    job.get("error"),
-    })
+    if job["status"] in ("done", "error") and not job.get("_logged"):
+        job["_logged"] = True
+        write_usage_log(
+            job.get("user_name"), job.get("script_name"), job.get("video_name"),
+            job["status"],
+            job.get("error", "")[:200] if job["status"] == "error" else ""
+        )
+    return jsonify({"status": job["status"], "progress": job["progress"],
+                    "log": job["log"], "error": job.get("error")})
 
 
 @app.route("/api/download/<job_id>")
@@ -581,11 +610,33 @@ def download(job_id):
     path = job["output_path"]
     if not path or not Path(path).exists():
         return jsonify({"error": "Output file missing"}), 500
-    return send_file(path, as_attachment=True,
-                     download_name="timecoded_script.docx")
+    return send_file(path, as_attachment=True, download_name="timecoded_script.docx")
+
+
+@app.route("/usage")
+def usage_log():
+    pw = os.environ.get("USAGE_PASSWORD", "")
+    if pw and request.args.get("key") != pw:
+        return "Unauthorised", 403
+    if not LOG_FILE.exists():
+        return "<p>No usage data yet.</p>"
+    with open(LOG_FILE, encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if len(rows) < 2:
+        return "<p>No usage data yet.</p>"
+    headers, data = rows[0], list(reversed(rows[1:]))
+    tbl = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in data)
+    hdr = "".join(f"<th>{h}</th>" for h in headers)
+    return f"""<!DOCTYPE html><html><head><title>Usage Log</title>
+<style>body{{font-family:Arial,sans-serif;padding:30px;background:#0f0f1a;color:#e8e8f0}}
+h1{{color:#5b6ef5;margin-bottom:20px}}table{{border-collapse:collapse;width:100%;font-size:13px}}
+th{{background:#1f3864;color:#fff;padding:10px 14px;text-align:left}}
+td{{padding:8px 14px;border-bottom:1px solid #2e2e50}}tr:hover td{{background:#1a1a2e}}</style>
+</head><body><h1>Stampede VO Formatter — Usage Log</h1>
+<p style=color:#8080a8>{len(data)} jobs total</p>
+<table><thead><tr>{hdr}</tr></thead><tbody>{tbl}</tbody></table></body></html>"""
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
-
