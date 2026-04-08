@@ -72,9 +72,38 @@ def dur_str(secs):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_source_script(docx_path):
+    """
+    Parse a two-column Stampede source script:
+
+      Col 0 (left)  — scene/segment name, e.g. "BRIMMING WITH BUNDLES"
+                      Only populated on the first row of each scene.
+      Col 1 (right) — script content:
+                        Bold UPPERCASE → VO
+                        Italic / SPEAKER: dialogue → Actuality
+
+    Returns list of dicts: {type, speaker, text}
+    type = 'section' | 'vo' | 'act'
+    """
     from docx import Document
 
-    doc   = Document(str(docx_path))
+    p = Path(docx_path)
+    if not p.exists():
+        raise RuntimeError(f"File not found: {docx_path}")
+    if p.stat().st_size < 4096:
+        raise RuntimeError(
+            f"File appears to be a OneDrive cloud placeholder ({p.stat().st_size} bytes). "
+            "Right-click → 'Always keep on this device', then retry."
+        )
+
+    import tempfile, shutil
+    tmp = Path(tempfile.mkdtemp()) / "source.docx"
+    shutil.copy2(str(p), str(tmp))
+
+    try:
+        doc = Document(str(tmp))
+    except Exception as e:
+        raise RuntimeError(f"Cannot open script file (is it open in Word?): {e}")
+
     lines = []
 
     def is_bold(para):
@@ -83,7 +112,8 @@ def parse_source_script(docx_path):
     def is_italic(para):
         return any(r.italic for r in para.runs if r.text.strip())
 
-    def classify_cell(cell):
+    def classify_content_cell(cell):
+        """Parse the right-hand content cell of a script row."""
         results = []
         paras   = cell.paragraphs
         i       = 0
@@ -96,7 +126,8 @@ def parse_source_script(docx_path):
             bold   = is_bold(para)
             italic = is_italic(para)
 
-            if bold and text == text.upper() and len(text) > 3:
+            # VO: bold AND uppercase
+            if bold and text == text.upper() and len(text) > 2:
                 block = [text]
                 while i + 1 < len(paras):
                     nxt = paras[i + 1]
@@ -105,21 +136,12 @@ def parse_source_script(docx_path):
                         block.append(nt); i += 1
                     else:
                         break
-                results.append({"type": "vo", "speaker": None, "text": " / ".join(block)})
+                results.append({"type": "vo", "speaker": None,
+                                 "text": " / ".join(block)})
 
-            elif bold and not italic:
-                tup = text.upper()
-                if any(kw in tup for kw in [
-                    "PART ", "ACT ", "WEIGHT LOSS", "COLD OPEN", "TITLES",
-                    "CODA", "RECAP", "COLD", "TEASER", "TAG", "BEAT"]):
-                    results.append({"type": "part",    "speaker": None, "text": text})
-                elif len(text.split()) <= 6:
-                    results.append({"type": "section", "speaker": None, "text": text})
-                else:
-                    results.append({"type": "vo",      "speaker": None, "text": text})
-
-            elif italic or re.match(r'^[A-Z][A-Z\s\.\-]+:', text):
-                m = re.match(r'^([A-Z][A-Z\s\.\-]+):\s*(.*)', text)
+            # Actuality: italic or SPEAKER: dialogue pattern
+            elif italic or re.match(r'^[A-Z][A-Z0-9\s\.\-]+:\s', text):
+                m = re.match(r'^([A-Z][A-Z0-9\s\.\-]+):\s*(.*)', text)
                 if m:
                     speaker = m.group(1).strip()
                     diag    = m.group(2).strip()
@@ -127,55 +149,76 @@ def parse_source_script(docx_path):
                     while i + 1 < len(paras):
                         nxt = paras[i + 1]
                         nt  = nxt.text.strip()
-                        if not nt or re.match(r'^[A-Z][A-Z\s\.\-]+:', nt) or (is_bold(nxt) and nt == nt.upper()):
+                        if (not nt
+                                or re.match(r'^[A-Z][A-Z0-9\s\.\-]+:\s', nt)
+                                or (is_bold(nxt) and nt == nt.upper())):
                             break
                         block.append(nt); i += 1
                     results.append({"type": "act", "speaker": speaker,
                                     "text": " ".join(block)})
                 else:
                     results.append({"type": "act", "speaker": None, "text": text})
+
+            # Bold mixed-case or short bold → treat as VO/label
+            elif bold:
+                results.append({"type": "vo", "speaker": None, "text": text})
+
             else:
                 results.append({"type": "act", "speaker": None, "text": text})
+
             i += 1
         return results
 
-    # Find the script table by looking for TC column headers.
-    # This skips the production info table at the top of Stampede scripts.
-    TC_KEYWORDS = {"time code", "timecode", "tc in", "tc out", "duration"}
-    SCRIPT_TABLE_IDX = None
-    for tidx, table in enumerate(doc.tables):
+    # ── Walk tables ───────────────────────────────────────────────────────────
+    # Find the script table: the one whose rows have 2 columns and whose
+    # first column occasionally contains scene names.
+    # Prefer the largest table if multiple exist.
+    script_table = None
+    for table in doc.tables:
         if not table.rows:
             continue
+        # Skip header tables (contain "Time Code" etc.)
         first_row_text = " ".join(
             c.text.strip().lower() for c in table.rows[0].cells
         )
+        TC_KEYWORDS = {"time code", "timecode", "tc in", "tc out"}
         if any(kw in first_row_text for kw in TC_KEYWORDS):
-            SCRIPT_TABLE_IDX = tidx
-            break
+            continue
+        # Pick the table with the most rows
+        if script_table is None or len(table.rows) > len(script_table.rows):
+            script_table = table
 
-    tables_to_parse = (
-        [doc.tables[SCRIPT_TABLE_IDX]] if SCRIPT_TABLE_IDX is not None
-        else doc.tables   # fallback: parse all if no TC table found
-    )
+    if script_table is None:
+        raise RuntimeError(
+            "Could not find a script table in the document. "
+            "Please check the source file format."
+        )
 
-    for table in tables_to_parse:
-        for row in table.rows:
-            if not row.cells:
-                continue
-            cell = row.cells[-1] if len(row.cells) >= 2 else row.cells[0]
-            ct   = cell.text.strip().upper()
-            if ct in ("SCRIPT & VO", "SCRIPT", "VO", "CONTENT", "",
-                      "TIME CODE IN", "TIME CODE OUT", "DURATION",
-                      "TC IN", "TC OUT"):
-                continue
-            lines.extend(classify_cell(cell))
+    current_section = None
 
-    # NOTE: we do NOT parse doc.paragraphs (outside the table).
-    # Those contain the document title block (production number, title,
-    # version, date etc.) which must not be treated as script content.
-    # All actual VO and actuality content lives inside the table.
+    for row in script_table.rows:
+        cells = row.cells
+        if len(cells) < 2:
+            continue
+
+        left  = cells[0].text.strip()
+        right = cells[1].text.strip()
+
+        # Left column: scene/segment name — emit as section header
+        if left:
+            # Clean up bold markers and normalise
+            scene = left.strip("*").strip()
+            if scene and scene != current_section:
+                current_section = scene
+                lines.append({"type": "section", "speaker": None,
+                               "text": scene})
+
+        # Right column: VO and actuality content
+        if right:
+            lines.extend(classify_content_cell(cells[1]))
 
     return lines
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
