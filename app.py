@@ -226,7 +226,7 @@ def parse_source_script(docx_path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def extract_audio(video_path, out_wav):
-    """Extract mono 16 kHz WAV from video. Returns path to wav file."""
+    """Extract mono 16 kHz WAV from video (mixed down). Returns path."""
     cmd = [
         "ffmpeg", "-y", "-i", str(video_path),
         "-vn", "-acodec", "pcm_s16le", "-ar", "16000", "-ac", "1",
@@ -236,6 +236,42 @@ def extract_audio(video_path, out_wav):
     if result.returncode != 0:
         raise RuntimeError(f"ffmpeg failed:\n{result.stderr[-800:]}")
     return out_wav
+
+
+def extract_channel(video_path, out_mp3, channel=0):
+    """
+    Extract a single channel from a stereo file as MP3.
+    channel=0 → left  (actuality/dialogue)
+    channel=1 → right (VO narration)
+    """
+    pan = f"pan=mono|c0=c{channel}"
+    cmd = [
+        "ffmpeg", "-y", "-i", str(video_path),
+        "-af", pan,
+        "-ar", "16000", "-ac", "1",
+        "-b:a", "64k",
+        str(out_mp3)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg channel extract failed:\n{result.stderr[-400:]}")
+    return out_mp3
+
+
+def is_stereo(video_path):
+    """Return True if the audio has 2 or more channels."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-select_streams", "a:0",
+        "-show_entries", "stream=channels",
+        "-of", "csv=p=0",
+        str(video_path)
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        return int(result.stdout.strip()) >= 2
+    except:
+        return False
 
 
 def compress_audio(wav_path, out_mp3):
@@ -291,22 +327,147 @@ def transcribe_openai(audio_path, api_key):
 
 def match_timecodes(script_lines, segments, tc_offset_secs, fps):
     """
-    Actuality-anchored matching strategy:
+    Dual-channel or mono matching:
 
-    1. Match ACTUALITY lines to Whisper segments (dialogue is clearly audible).
-    2. Use matched actualities as TC anchors throughout the script.
-    3. Interpolate VO lines between their surrounding actuality anchors.
+    If `segments` is a dict {"dial": [...], "vo": [...]}, use:
+      - dial segments to match actuality lines  (clean dialogue channel)
+      - vo   segments to match VO lines         (clean narration channel)
 
-    This works because VO narration is often over music/title cards and
-    Whisper cannot reliably transcribe it, whereas on-screen dialogue
-    (actuality) is clearly audible and matches well.
+    If `segments` is a plain list (mono/mixed), fall back to:
+      - actuality-anchored matching with VO interpolation
 
-    Confirmed actuality TCs have no prefix.
-    Interpolated VO TCs are prefixed with ~ to flag for review.
+    Confirmed TCs have no prefix. Uncertain/interpolated TCs get ~ prefix.
     """
     if not segments:
         return [{**l, "tc_in": "", "tc_out": "", "dur": ""} for l in script_lines]
 
+    # ── Dual-channel path ─────────────────────────────────────────────────────
+    if isinstance(segments, dict):
+        dial_segs = segments.get("dial", [])
+        vo_segs   = segments.get("vo",   [])
+
+        WINDOW    = 12
+        LOOKAHEAD = 120
+        THRESHOLD = 0.20
+        FALLBACK  = 0.08
+
+        def best_match(norm_text, seg_list, cursor):
+            n = len(seg_list)
+            best_score = 0.0
+            best_i = best_j = None
+            end = min(cursor + LOOKAHEAD, n)
+            for i in range(cursor, end):
+                joined = ""
+                for j in range(i, min(i + WINDOW, end)):
+                    joined      = (joined + " " + seg_list[j]["text"]).strip()
+                    norm_joined = normalize(joined)
+                    score       = similarity(norm_text, norm_joined)
+                    if len(norm_text) > 6 and norm_text in norm_joined:
+                        score = max(score, 0.85)
+                    if score > best_score:
+                        best_score = score
+                        best_i, best_j = i, j
+            return best_score, best_i, best_j
+
+        results       = []
+        dial_cursor   = 0
+        vo_cursor     = 0
+        total_audio   = max(
+            dial_segs[-1]["end"] if dial_segs else 0,
+            vo_segs[-1]["end"]   if vo_segs   else 0
+        )
+
+        for line in script_lines:
+            ltype = line.get("type", "act")
+            text  = line.get("text", "").strip()
+
+            if ltype in ("section", "part", "coda") or not text:
+                results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                                "_t_in": None, "_matched": False})
+                continue
+
+            norm_text = normalize(text)
+
+            # Choose which channel to match against
+            if ltype == "vo":
+                seg_list = vo_segs
+                cursor   = vo_cursor
+            else:
+                seg_list = dial_segs
+                cursor   = dial_cursor
+
+            score, bi, bj = best_match(norm_text, seg_list, cursor)
+
+            if score >= THRESHOLD and bi is not None:
+                if ltype == "vo":
+                    vo_cursor = bj + 1
+                else:
+                    dial_cursor = bj + 1
+                t_in  = seg_list[bi]["start"]
+                t_out = seg_list[bj]["end"]
+                results.append({
+                    **line,
+                    "tc_in":  seconds_to_tc(t_in,  tc_offset_secs, fps),
+                    "tc_out": seconds_to_tc(t_out, tc_offset_secs, fps),
+                    "dur":    dur_str(t_out - t_in),
+                    "_t_in":    t_in,
+                    "_matched": True,
+                })
+            elif score >= FALLBACK and bi is not None:
+                if ltype == "vo":
+                    vo_cursor = bj + 1
+                else:
+                    dial_cursor = bj + 1
+                t_in  = seg_list[bi]["start"]
+                t_out = seg_list[bj]["end"]
+                results.append({
+                    **line,
+                    "tc_in":  "~" + seconds_to_tc(t_in,  tc_offset_secs, fps),
+                    "tc_out": "~" + seconds_to_tc(t_out, tc_offset_secs, fps),
+                    "dur":    dur_str(t_out - t_in),
+                    "_t_in":    t_in,
+                    "_matched": True,
+                })
+            else:
+                results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                                "_t_in": None, "_matched": False})
+
+        # Interpolate any remaining blanks between anchors
+        anchors = [(-1, 0.0)]
+        for i, r in enumerate(results):
+            if r.get("_t_in") is not None:
+                anchors.append((i, r["_t_in"]))
+        anchors.append((len(results), total_audio))
+
+        for idx, r in enumerate(results):
+            if r.get("_t_in") is not None:
+                continue
+            if r.get("type") in ("section","part","coda") or not r.get("text"):
+                continue
+            prev_a = anchors[0]
+            next_a = anchors[-1]
+            for a in anchors:
+                if a[0] < idx:   prev_a = a
+                elif a[0] > idx: next_a = a; break
+            prev_i, prev_t = prev_a
+            next_i, next_t = next_a
+            span = max(next_i - prev_i, 1)
+            frac = (idx - prev_i) / span
+            est_in  = prev_t + frac * (next_t - prev_t)
+            est_out = min(est_in + 4.0, next_t)
+            results[idx]["tc_in"]  = "~" + seconds_to_tc(est_in,  tc_offset_secs, fps)
+            results[idx]["tc_out"] = "~" + seconds_to_tc(est_out, tc_offset_secs, fps)
+            results[idx]["dur"]    = dur_str(est_out - est_in)
+            results[idx]["_t_in"]  = est_in
+
+        n_conf  = sum(1 for r in results if r.get("_matched"))
+        n_interp = sum(1 for r in results if not r.get("_matched") and r.get("tc_in"))
+        for r in results:
+            r.pop("_matched", None); r.pop("_t_in", None)
+        print(f"Dual-channel match: {n_conf} confirmed | {n_interp} interpolated")
+        return results
+
+    # ── Mono / mixed fallback path ────────────────────────────────────────────
     n_segs     = len(segments)
     seg_cursor = 0
     WINDOW     = 12
@@ -764,47 +925,61 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
 
         # 2 — Audio: extract from video, or use directly if already audio
         AUDIO_EXTS = {".mp3", ".mp4a", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
-        VIDEO_EXTS = {".mp4", ".mov", ".mxf", ".avi", ".mkv", ".mts", ".m2ts"}
         upload_ext = Path(video_path).suffix.lower()
 
-        mp3 = tmp_dir / "audio.mp3"
+        mp3      = tmp_dir / "audio.mp3"
+        mp3_dial = tmp_dir / "audio_dial.mp3"
+        mp3_vo   = tmp_dir / "audio_vo.mp3"
 
         if upload_ext in AUDIO_EXTS and upload_ext == ".mp3":
-            # Already an MP3 — check size and use directly
             size_mb = Path(video_path).stat().st_size / 1024 / 1024
-            log(f"Audio file detected ({size_mb:.1f} MB) — skipping extraction…", 20)
+            log(f"Audio file detected ({size_mb:.1f} MB)…", 20)
             if size_mb > 24:
-                # Still too big — re-compress at lower bitrate
                 log("File over 25 MB — re-compressing…", 25)
                 compress_audio(video_path, mp3)
             else:
                 import shutil as _sh
                 _sh.copy2(video_path, mp3)
-            size_mb = mp3.stat().st_size / 1024 / 1024
-            log(f"✓ Audio ready — {size_mb:.1f} MB", 35)
-
         elif upload_ext in AUDIO_EXTS:
-            # Other audio format — just compress/convert to MP3
             size_mb = Path(video_path).stat().st_size / 1024 / 1024
-            log(f"Audio file detected ({upload_ext}, {size_mb:.1f} MB) — converting to MP3…", 20)
+            log(f"Audio file detected ({upload_ext}, {size_mb:.1f} MB) — converting…", 20)
             compress_audio(video_path, mp3)
-            size_mb = mp3.stat().st_size / 1024 / 1024
-            log(f"✓ Audio ready — {size_mb:.1f} MB", 35)
-
         else:
-            # Video file — extract then compress as before
             log("Extracting audio from video (ffmpeg)…", 20)
             wav = tmp_dir / "audio.wav"
             extract_audio(video_path, wav)
-            log("Compressing audio for upload…", 30)
+            log("Compressing audio…", 28)
             compress_audio(wav, mp3)
-            size_mb = mp3.stat().st_size / 1024 / 1024
-            log(f"✓ Audio ready — {size_mb:.1f} MB", 35)
 
-        # 3 — Transcribe
-        log("Sending to OpenAI Whisper API…", 40)
-        segments = transcribe_openai(mp3, api_key)
-        log(f"✓ Transcription complete — {len(segments)} segments", 70)
+        size_mb = mp3.stat().st_size / 1024 / 1024
+        log(f"✓ Audio ready — {size_mb:.1f} MB", 30)
+
+        # 3 — Transcribe: dual-channel if stereo, mono fallback otherwise
+        stereo = is_stereo(video_path)
+
+        if stereo:
+            log("Stereo file detected — extracting dialogue (L) and VO (R) channels…", 32)
+            extract_channel(video_path, mp3_dial, channel=0)
+            extract_channel(video_path, mp3_vo,   channel=1)
+
+            dial_mb = mp3_dial.stat().st_size / 1024 / 1024
+            vo_mb   = mp3_vo.stat().st_size   / 1024 / 1024
+            log(f"Dialogue channel: {dial_mb:.1f} MB  |  VO channel: {vo_mb:.1f} MB", 34)
+
+            log("Transcribing dialogue channel (Whisper)…", 36)
+            dial_segments = transcribe_openai(mp3_dial, api_key)
+            log(f"✓ Dialogue: {len(dial_segments)} segments", 52)
+
+            log("Transcribing VO channel (Whisper)…", 54)
+            vo_segments = transcribe_openai(mp3_vo, api_key)
+            log(f"✓ VO: {len(vo_segments)} segments", 68)
+
+            segments = {"dial": dial_segments, "vo": vo_segments}
+            log("✓ Dual-channel transcription complete", 70)
+        else:
+            log("Mono/mixed file — sending to Whisper API…", 36)
+            segments = transcribe_openai(mp3, api_key)
+            log(f"✓ Transcription complete — {len(segments)} segments", 70)
 
         # 4 — Match
         log("Matching timecodes to script…", 75)
