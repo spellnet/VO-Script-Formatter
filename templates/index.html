@@ -1,0 +1,508 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stampede VO Script Auto Formatter</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:      #0f0f1a;
+      --card:    #1a1a2e;
+      --card2:   #22223a;
+      --border:  #2e2e50;
+      --accent:  #5b6ef5;
+      --accent2: #7c3aed;
+      --success: #22c55e;
+      --warn:    #f59e0b;
+      --err:     #ef4444;
+      --txt:     #e8e8f0;
+      --txt2:    #8080a8;
+      --txt3:    #555580;
+      --mono:    "Consolas", "Courier New", monospace;
+    }
+
+    body {
+      background: var(--bg);
+      color: var(--txt);
+      font-family: "Segoe UI", system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    /* ── Header ── */
+    header {
+      width: 100%;
+      background: linear-gradient(135deg, #3b3bcc 0%, #7c3aed 100%);
+      padding: 20px 40px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      box-shadow: 0 4px 24px #0008;
+    }
+    header .icon { font-size: 28px; }
+    header h1 { font-size: 20px; font-weight: 700; color: #fff; }
+    header p  { font-size: 12px; color: #c0b8ff; margin-top: 2px; }
+
+    /* ── Main container ── */
+    main {
+      width: 100%;
+      max-width: 760px;
+      padding: 32px 20px 60px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    .card h2 {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--txt2);
+      text-transform: uppercase;
+      letter-spacing: .08em;
+      margin-bottom: 16px;
+    }
+
+    /* ── File drop zones ── */
+    .drop-zone {
+      border: 2px dashed var(--border);
+      border-radius: 10px;
+      padding: 28px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: border-color .2s, background .2s;
+      position: relative;
+      margin-bottom: 14px;
+    }
+    .drop-zone:hover, .drop-zone.drag-over {
+      border-color: var(--accent);
+      background: #5b6ef512;
+    }
+    .drop-zone.has-file {
+      border-color: var(--success);
+      border-style: solid;
+      background: #22c55e0d;
+    }
+    .drop-zone input[type="file"] {
+      position: absolute; inset: 0; opacity: 0; cursor: pointer; width: 100%; height: 100%;
+    }
+    .drop-zone .dz-icon { font-size: 28px; margin-bottom: 8px; }
+    .drop-zone .dz-label { font-size: 13px; font-weight: 600; color: var(--txt); }
+    .drop-zone .dz-hint  { font-size: 11px; color: var(--txt2); margin-top: 4px; }
+    .drop-zone .dz-name  {
+      font-size: 12px; color: var(--success); margin-top: 8px;
+      font-family: var(--mono); word-break: break-all;
+    }
+
+    /* ── Form fields ── */
+    .fields {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      gap: 14px;
+    }
+    .field label {
+      display: block; font-size: 11px; font-weight: 600;
+      color: var(--txt2); text-transform: uppercase; letter-spacing: .06em;
+      margin-bottom: 6px;
+    }
+    .field input, .field select {
+      width: 100%;
+      background: var(--card2);
+      border: 1px solid var(--border);
+      border-radius: 7px;
+      padding: 9px 12px;
+      color: var(--txt);
+      font-size: 13px;
+      font-family: var(--mono);
+      outline: none;
+      transition: border-color .15s;
+    }
+    .field input:focus, .field select:focus {
+      border-color: var(--accent);
+    }
+    .field select option { background: var(--card2); }
+
+    /* API key field — full width */
+    .field.full { grid-column: 1 / -1; }
+    .field .hint {
+      font-size: 10px; color: var(--txt3); margin-top: 5px; line-height: 1.5;
+    }
+    .field .hint a { color: var(--accent); text-decoration: none; }
+    .field .hint a:hover { text-decoration: underline; }
+
+    /* ── Run button ── */
+    #runBtn {
+      width: 100%;
+      padding: 15px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: opacity .15s, transform .1s;
+      letter-spacing: .03em;
+    }
+    #runBtn:hover:not(:disabled) { opacity: .92; transform: translateY(-1px); }
+    #runBtn:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+    /* ── Progress section ── */
+    #progressSection { display: none; }
+    #progressSection.visible { display: block; }
+
+    .progress-bar-bg {
+      background: var(--card2);
+      border-radius: 99px;
+      height: 8px;
+      overflow: hidden;
+      margin-bottom: 20px;
+    }
+    .progress-bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      border-radius: 99px;
+      width: 0%;
+      transition: width .4s ease;
+    }
+
+    /* ── Log ── */
+    #log {
+      background: #0b0b16;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px;
+      font-family: var(--mono);
+      font-size: 12px;
+      line-height: 1.8;
+      max-height: 280px;
+      overflow-y: auto;
+      color: var(--txt2);
+    }
+    #log .log-ok   { color: var(--success); }
+    #log .log-err  { color: var(--err); }
+    #log .log-head { color: var(--txt); font-weight: 600; }
+
+    /* ── Download button ── */
+    #downloadBtn {
+      display: none;
+      width: 100%;
+      padding: 15px;
+      background: var(--success);
+      border: none;
+      border-radius: 10px;
+      color: #fff;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      margin-top: 14px;
+      text-decoration: none;
+      text-align: center;
+      transition: opacity .15s;
+    }
+    #downloadBtn:hover { opacity: .88; }
+    #downloadBtn.visible { display: block; }
+
+    /* ── Cost estimate ── */
+    .cost-note {
+      font-size: 11px;
+      color: var(--txt3);
+      text-align: center;
+      margin-top: -8px;
+    }
+
+    /* ── Save tip ── */
+    .save-tip {
+      margin-top: 14px;
+      padding: 10px 14px;
+      background: #1e1e38;
+      border-left: 3px solid var(--warn);
+      border-radius: 0 6px 6px 0;
+      font-size: 11px;
+      color: var(--txt2);
+      line-height: 1.6;
+    }
+    .save-tip strong { color: var(--txt); }
+    .save-tip em     { font-style: normal; color: var(--warn); }
+
+    /* ── Responsive ── */
+    @media (max-width: 520px) {
+      .fields { grid-template-columns: 1fr 1fr; }
+      header { padding: 16px 20px; }
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="icon">🎬</div>
+  <div>
+    <h1>Stampede VO Script Auto Formatter</h1>
+    <p>Automatic timecoding via OpenAI Whisper · No software to install</p>
+  </div>
+</header>
+
+<main>
+
+  <!-- Files -->
+  <div class="card">
+    <h2>Input Files</h2>
+
+    <div class="drop-zone" id="dzScript">
+      <input type="file" id="scriptFile" accept=".docx" />
+      <div class="dz-icon">📄</div>
+      <div class="dz-label">Source Script (.docx)</div>
+      <div class="dz-hint">Click or drag your two-column editorial script here</div>
+      <div class="dz-name" id="scriptName"></div>
+    </div>
+
+    <div class="drop-zone" id="dzVideo">
+      <input type="file" id="videoFile" accept=".mp4,.mov,.mxf,.avi,.mkv,.mp3,.m4a,.aac,.wav,.flac" />
+      <div class="dz-icon">🎥</div>
+      <div class="dz-label">Video or Audio File</div>
+      <div class="dz-hint">.mp4 .mov .mxf — or pre-extracted audio: .mp3 .wav .m4a .aac</div>
+      <div class="dz-name" id="videoName"></div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div class="card">
+    <h2>Settings</h2>
+    <div class="fields">
+
+      <div class="field full">
+        <label>Your Name</label>
+        <input type="text" id="userName" placeholder="e.g. Sarah" autocomplete="name" />
+        <div class="hint">Used for usage tracking only — so we know who generated each script.</div>
+      </div>
+
+      {% if not has_permanent_key %}
+      <div class="field full">
+        <label>OpenAI API Key</label>
+        <input type="password" id="apiKey" placeholder="sk-…" autocomplete="off" />
+        <div class="hint">
+          Get yours at <a href="https://platform.openai.com/api-keys" target="_blank">platform.openai.com/api-keys</a> ·
+          Charged at ~$0.006/min · a 42-min programme costs ~$0.25
+        </div>
+      </div>
+      {% endif %}
+
+      <div class="field">
+        <label>TC Start</label>
+        <input type="text" id="tcOffset" value="10:01:00:00" placeholder="HH:MM:SS:FF" />
+      </div>
+      </div>
+
+      <div class="field">
+        <label>Frame Rate</label>
+        <select id="fps">
+          <option value="25" selected>25 fps (UK/Europe)</option>
+          <option value="29.97">29.97 fps (US)</option>
+          <option value="24">24 fps</option>
+          <option value="23.976">23.976 fps</option>
+          <option value="30">30 fps</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label>Output Filename</label>
+        <input type="text" id="outputName" placeholder="e.g. K9_Heroes_EP1_PP" />
+        <div class="hint">Leave blank to use the script filename. .docx is added automatically.</div>
+      </div>
+
+    </div>
+
+    <div class="save-tip">
+      💡 <strong>To choose where the file saves:</strong> in Chrome or Edge go to
+      <em>Settings → Downloads → Ask where to save each file</em> — turn that on
+      and you'll get a Save As dialog every time.
+    </div>
+
+  </div>
+
+  <!-- Run -->
+  <button id="runBtn" disabled>▶ &nbsp; Format Script</button>
+  <div class="cost-note">Your API key is used only for this request and never stored on the server.</div>
+
+  <!-- Progress -->
+  <div class="card" id="progressSection">
+    <h2>Progress</h2>
+    <div class="progress-bar-bg">
+      <div class="progress-bar-fill" id="progressFill"></div>
+    </div>
+    <div id="log"></div>
+    <a id="downloadBtn" href="#">
+      ⬇ &nbsp; Download Formatted Script
+    </a>
+  </div>
+
+</main>
+
+<script>
+  // ── File drop zones ────────────────────────────────────────────────────────
+  function setupDropZone(dzId, inputId, nameId) {
+    const dz    = document.getElementById(dzId);
+    const input = document.getElementById(inputId);
+    const name  = document.getElementById(nameId);
+
+    input.addEventListener("change", () => {
+      if (input.files[0]) {
+        name.textContent = "✓  " + input.files[0].name;
+        dz.classList.add("has-file");
+        // Auto-populate output filename from script name
+        if (inputId === "scriptFile") {
+          const base = input.files[0].name.replace(/\.docx$/i, "");
+          const outField = document.getElementById("outputName");
+          if (!outField.value) outField.value = base + "_TIMECODED";
+        }
+        checkReady();
+      }
+    });
+
+    dz.addEventListener("dragover",  e => { e.preventDefault(); dz.classList.add("drag-over"); });
+    dz.addEventListener("dragleave", ()  => dz.classList.remove("drag-over"));
+    dz.addEventListener("drop", e => {
+      e.preventDefault();
+      dz.classList.remove("drag-over");
+      const file = e.dataTransfer.files[0];
+      if (file) {
+        const dt = new DataTransfer();
+        dt.items.add(file);
+        input.files = dt.files;
+        name.textContent = "✓  " + file.name;
+        dz.classList.add("has-file");
+        checkReady();
+      }
+    });
+  }
+
+  setupDropZone("dzScript", "scriptFile", "scriptName");
+  setupDropZone("dzVideo",  "videoFile",  "videoName");
+
+  // Also enable run button when name is entered
+  document.getElementById("userName").addEventListener("input", checkReady);
+  const apiKeyEl = document.getElementById("apiKey");
+  if (apiKeyEl) apiKeyEl.addEventListener("input", checkReady);
+
+  function checkReady() {
+    const hasScript = !!document.getElementById("scriptFile").files[0];
+    const hasVideo  = !!document.getElementById("videoFile").files[0];
+    const hasName   = document.getElementById("userName").value.trim().length > 0;
+    const keyEl     = document.getElementById("apiKey");
+    const hasKey    = !keyEl || keyEl.value.trim().startsWith("sk-");
+    document.getElementById("runBtn").disabled = !(hasScript && hasVideo && hasName && hasKey);
+  }
+
+  // ── Run ───────────────────────────────────────────────────────────────────
+  let currentJobId = null;
+  let pollInterval = null;
+
+  document.getElementById("runBtn").addEventListener("click", async () => {
+    const scriptFile = document.getElementById("scriptFile").files[0];
+    const videoFile  = document.getElementById("videoFile").files[0];
+    const apiKeyEl   = document.getElementById("apiKey");
+    const apiKey     = apiKeyEl ? apiKeyEl.value.trim() : "";
+    const userName   = document.getElementById("userName").value.trim();
+    const tcOffset   = document.getElementById("tcOffset").value.trim();
+    const fps        = document.getElementById("fps").value;
+
+    // Show progress section
+    const progressSection = document.getElementById("progressSection");
+    progressSection.classList.add("visible");
+    document.getElementById("log").innerHTML = "";
+    document.getElementById("progressFill").style.width = "0%";
+    document.getElementById("downloadBtn").classList.remove("visible");
+    document.getElementById("runBtn").disabled = true;
+    document.getElementById("runBtn").textContent = "Processing…";
+    // Upload
+    logLine("Uploading files…", "log-head");
+    const form = new FormData();
+    form.append("script",    scriptFile);
+    form.append("video",     videoFile);
+    form.append("user_name", userName);
+    form.append("tc_offset", tcOffset);
+    form.append("fps",       fps);
+    if (apiKey) form.append("api_key", apiKey);
+
+    let resp;
+    try {
+      resp = await fetch("/api/start", { method: "POST", body: form });
+    } catch(e) {
+      logLine("✗ Network error: " + e.message, "log-err");
+      resetBtn(); return;
+    }
+
+    const data = await resp.json();
+    if (data.error) {
+      logLine("✗ " + data.error, "log-err");
+      resetBtn(); return;
+    }
+
+    currentJobId = data.job_id;
+    logLine("✓ Upload complete. Job started.", "log-ok");
+
+    // Poll for status
+    let lastLogLen = 1;
+    pollInterval = setInterval(async () => {
+      const s = await fetch(`/api/status/${currentJobId}`).then(r => r.json());
+
+      // Append new log lines
+      const newLines = s.log.slice(lastLogLen - 1);
+      newLines.forEach(line => {
+        const cls = line.startsWith("✓") ? "log-ok"
+                  : line.startsWith("✗") ? "log-err"
+                  : line.startsWith("▸") ? "log-head" : "";
+        logLine(line, cls);
+      });
+      lastLogLen = s.log.length + 1;
+
+      // Update progress
+      document.getElementById("progressFill").style.width = s.progress + "%";
+
+      if (s.status === "done") {
+        clearInterval(pollInterval);
+        const dlBtn   = document.getElementById("downloadBtn");
+        const rawName = document.getElementById("outputName").value.trim();
+        const fname   = (rawName || "timecoded_script").replace(/\.docx$/i, "") + ".docx";
+        dlBtn.href     = `/api/download/${currentJobId}`;
+        dlBtn.setAttribute("download", fname);
+        dlBtn.classList.add("visible");
+        document.getElementById("runBtn").textContent = "▶  Generate Timecoded Script";
+        document.getElementById("runBtn").disabled = false;
+      } else if (s.status === "error") {
+        clearInterval(pollInterval);
+        logLine("✗ " + (s.error || "Unknown error"), "log-err");
+        resetBtn();
+      }
+    }, 1500);
+  });
+
+  function logLine(text, cls) {
+    const log  = document.getElementById("log");
+    const line = document.createElement("div");
+    if (cls) line.className = cls;
+    line.textContent = text;
+    log.appendChild(line);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function resetBtn() {
+    const btn = document.getElementById("runBtn");
+    btn.textContent = "▶  Format Script";
+    checkReady();
+  }
+</script>
+
+</body>
+</html>
