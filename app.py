@@ -149,14 +149,10 @@ def parse_source_script(docx_path):
                 continue
             lines.extend(classify_cell(cell))
 
-    for para in doc.paragraphs:
-        text = para.text.strip()
-        if not text:
-            continue
-        if is_bold(para) and len(text) > 5:
-            lines.append({"type": "vo",  "speaker": None, "text": text})
-        elif text:
-            lines.append({"type": "act", "speaker": None, "text": text})
+    # NOTE: we do NOT parse doc.paragraphs (outside the table).
+    # Those contain the document title block (production number, title,
+    # version, date etc.) which must not be treated as script content.
+    # All actual VO and actuality content lives inside the table.
 
     return lines
 
