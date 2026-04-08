@@ -230,14 +230,27 @@ def transcribe_openai(audio_path, api_key):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def match_timecodes(script_lines, segments, tc_offset_secs, fps):
+    """
+    Forward-pass fuzzy matching of script lines to Whisper segments.
+
+    Key fixes vs previous version:
+    - Cursor advances PAST the matched segment after each hit, so the same
+      segment can never be reused for the next line (fixes "all same TC" bug)
+    - Lower threshold (0.18) so more VO lines get matched even when Whisper
+      picks up narration imperfectly through music beds
+    - Wider lookahead (80 segs) to handle longer gaps between VO lines
+    - Falls back to best available match if nothing meets threshold, provided
+      the score is at least 0.10 -- leaves blank only if truly no signal at all
+    """
     if not segments:
         return [{**l, "tc_in": "", "tc_out": "", "dur": ""} for l in script_lines]
 
     results    = []
     seg_cursor = 0
-    WINDOW     = 8
-    LOOKAHEAD  = 60
-    THRESHOLD  = 0.28
+    WINDOW     = 10   # max consecutive segments to join when matching
+    LOOKAHEAD  = 80   # how far ahead to search from current cursor
+    THRESHOLD  = 0.18 # accept match above this score
+    FALLBACK   = 0.10 # use best-effort match above this if nothing hits threshold
     n_segs     = len(segments)
 
     for line in script_lines:
@@ -255,9 +268,10 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
         for i in range(seg_cursor, search_end):
             joined = ""
             for j in range(i, min(i + WINDOW, search_end)):
-                joined     = (joined + " " + segments[j]["text"]).strip()
+                joined      = (joined + " " + segments[j]["text"]).strip()
                 norm_joined = normalize(joined)
-                score      = similarity(norm_line, norm_joined)
+                score       = similarity(norm_line, norm_joined)
+                # Boost score if script text is a substring of the transcript
                 if len(norm_line) > 8 and norm_line in norm_joined:
                     score = max(score, 0.75)
                 if score > best_score:
@@ -265,13 +279,26 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                     best_i, best_j = i, j
 
         if best_score >= THRESHOLD and best_i is not None:
-            seg_cursor = best_i
+            # Advance cursor PAST the matched segment so it cannot repeat
+            seg_cursor = best_j + 1
             t_in  = segments[best_i]["start"]
             t_out = segments[best_j]["end"]
             results.append({
                 **line,
                 "tc_in":  seconds_to_tc(t_in,  tc_offset_secs, fps),
                 "tc_out": seconds_to_tc(t_out, tc_offset_secs, fps),
+                "dur":    dur_str(t_out - t_in),
+            })
+        elif best_score >= FALLBACK and best_i is not None:
+            # Best-effort: use the match but flag it with a ~ prefix so the
+            # editor knows it needs checking
+            seg_cursor = best_j + 1
+            t_in  = segments[best_i]["start"]
+            t_out = segments[best_j]["end"]
+            results.append({
+                **line,
+                "tc_in":  "~" + seconds_to_tc(t_in,  tc_offset_secs, fps),
+                "tc_out": "~" + seconds_to_tc(t_out, tc_offset_secs, fps),
                 "dur":    dur_str(t_out - t_in),
             })
         else:
