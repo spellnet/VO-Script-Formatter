@@ -3,7 +3,8 @@ PP Script Timecoder — Web App
 Flask backend: upload script + video → timecoded .docx via OpenAI Whisper API
 """
 
-import os, re, uuid, json, time, shutil, tempfile, threading, subprocess
+import os, re, uuid, json, time, shutil, tempfile, threading, subprocess, csv
+from datetime import datetime, timezone
 from pathlib import Path
 from difflib import SequenceMatcher
 
@@ -285,29 +286,52 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
 
 def build_output_docx(matched_lines, output_path, fps):
     """
-    Build the VO recording script .docx, matching the Stampede reference format:
-
-    VO rows     — TC In / TC Out / Duration filled, bold uppercase text
-    Actuality   — TC cells BLANK, italic text, Actuality: label
-    Section/Act — simple label rows kept as reference markers, no TC
+    Build the VO recording script .docx matching the Stampede template exactly:
+    - Calibri 10pt throughout
+    - A4 page, 1-inch margins
+    - Column widths: 990 / 990 / 973 / 6241 DXA
+    - Story headers:  #DEEBF6 blue,  merged full width
+    - TITLES/PART BREAK: #E2EFD9 green, merged
+    - ACT rows:       #FBE5D5 peach, merged
+    - Actuality rows: #E7E6E6 grey, TC cells blank
+    - VO rows:        white,  TC cells filled
     """
     from docx import Document
-    from docx.shared import Pt, RGBColor, Inches, Twips
+    from docx.shared import Pt, RGBColor, Inches, Cm
     from docx.oxml.ns import qn
     from docx.oxml import OxmlElement
     from docx.enum.text import WD_ALIGN_PARAGRAPH
     from docx.enum.table import WD_ALIGN_VERTICAL
 
+    # ── Column widths (DXA) ──────────────────────────────────────────────────
+    # Widths sized for HH:MM:SS:FF (11 chars Courier New 10pt) + cell padding
+    # Total kept at 9194 DXA to match original template table width
+    W_TC1 = 1440   # 1 inch — fits HH:MM:SS:FF without wrapping
+    W_TC2 = 1440   # 1 inch
+    W_DUR = 1440   # 1 inch
+    W_SCR = 4874   # remaining — ~3.4 inches for script text
+
     doc     = Document()
-    section = doc.sections[0]
-    section.page_width    = Inches(8.5)
-    section.page_height   = Inches(11)
-    section.left_margin   = Inches(0.75)
-    section.right_margin  = Inches(0.75)
-    section.top_margin    = Inches(0.75)
-    section.bottom_margin = Inches(0.75)
+    sec     = doc.sections[0]
+    sec.page_width    = Inches(8.27)   # A4
+    sec.page_height   = Inches(11.69)  # A4
+    sec.left_margin   = Inches(1.0)
+    sec.right_margin  = Inches(1.0)
+    sec.top_margin    = Inches(1.0)
+    sec.bottom_margin = Inches(1.0)
 
     # ── Helpers ──────────────────────────────────────────────────────────────
+
+    def set_cell_width(cell, dxa):
+        tc   = cell._tc
+        tcPr = tc.get_or_add_tcPr()
+        # Remove existing width if present
+        for old in tcPr.findall(qn("w:tcW")):
+            tcPr.remove(old)
+        tcW = OxmlElement("w:tcW")
+        tcW.set(qn("w:w"),    str(dxa))
+        tcW.set(qn("w:type"), "dxa")
+        tcPr.append(tcW)
 
     def set_bg(cell, hex_color):
         tc   = cell._tc
@@ -315,10 +339,10 @@ def build_output_docx(matched_lines, output_path, fps):
         shd  = OxmlElement("w:shd")
         shd.set(qn("w:val"),   "clear")
         shd.set(qn("w:color"), "auto")
-        shd.set(qn("w:fill"),  hex_color.replace("#", ""))
+        shd.set(qn("w:fill"),  hex_color.upper().replace("#", ""))
         tcPr.append(shd)
 
-    def set_borders(cell, color="CCCCCC"):
+    def set_borders(cell, color="AAAAAA"):
         tc   = cell._tc
         tcPr = tc.get_or_add_tcPr()
         tcB  = OxmlElement("w:tcBorders")
@@ -330,81 +354,75 @@ def build_output_docx(matched_lines, output_path, fps):
             tcB.append(t)
         tcPr.append(tcB)
 
-    def set_no_borders(cell):
-        """Make a cell visually borderless."""
-        tc   = cell._tc
-        tcPr = tc.get_or_add_tcPr()
-        tcB  = OxmlElement("w:tcBorders")
-        for side in ("top", "left", "bottom", "right"):
-            t = OxmlElement(f"w:{side}")
-            t.set(qn("w:val"),   "none")
-            t.set(qn("w:sz"),    "0")
-            t.set(qn("w:color"), "auto")
-            tcB.append(t)
-        tcPr.append(tcB)
-
     def add_run(para, text, bold=False, italic=False,
-                color=None, size=9, mono=False):
+                color=None, size=10, mono=False):
+        """Add a run. Font: Calibri 10pt by default."""
         r = para.add_run(text)
         r.bold      = bold
         r.italic    = italic
         r.font.size = Pt(size)
-        r.font.name = "Courier New" if mono else "Arial"
+        r.font.name = "Courier New" if mono else "Calibri"
         if color:
             rgb = tuple(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
             r.font.color.rgb = RGBColor(*rgb)
 
-    def empty_tc_cell(table_row, idx):
-        """Return a TC cell with borders but no content."""
-        cell = table_row.cells[idx]
-        set_borders(cell)
-        cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-        cell.paragraphs[0].clear()
-        return cell
+    def set_row_widths(row, widths):
+        for cell, w in zip(row.cells, widths):
+            set_cell_width(cell, w)
 
-    # ── Title block ──────────────────────────────────────────────────────────
+    COL_WIDTHS = [W_TC1, W_TC2, W_DUR, W_SCR]
+
+    # ── Title block (above table) ─────────────────────────────────────────────
     tp = doc.add_paragraph()
-    add_run(tp, "STAMPEDE PRODUCTIONS", bold=True, size=14)
+    add_run(tp, "STAMPEDE PRODUCTIONS", bold=True, size=12)
     tp2 = doc.add_paragraph()
-    add_run(tp2, "VO SCRIPT  —  AUTO FORMATTED", bold=True, size=11)
+    add_run(tp2, "VO SCRIPT  —  AUTO FORMATTED", bold=True, size=10)
     tp3 = doc.add_paragraph()
     add_run(tp3,
-        f"TC format: HH:MM:SS  ·  {fps}fps  ·  "
-        "Actuality rows shown for reference — timecodes on VO only",
-        italic=True, size=9, color="#666666")
+        f"TC: HH:MM:SS:FF  ·  {fps}fps  ·  "
+        "Actuality rows shown for reference only — timecodes on VO lines",
+        italic=True, size=9, color="#888888")
     doc.add_paragraph()
 
-    # ── Column widths ────────────────────────────────────────────────────────
-    # Content width = 7" = 10080 twips at 1440 twips/in
-    # Matching reference proportions:
-    # TC In: 1100, TC Out: 1100, Dur: 900, Script: 6980
-    W_TC  = 1100
-    W_DUR =  900
-    W_SCR = 6980
-
+    # ── Table ────────────────────────────────────────────────────────────────
     table = doc.add_table(rows=0, cols=4)
     table.style = "Table Grid"
 
-    def set_row_widths(row):
-        for cell, w in zip(row.cells, [W_TC, W_TC, W_DUR, W_SCR]):
-            tc   = cell._tc
-            tcPr = tc.get_or_add_tcPr()
-            tcW  = OxmlElement("w:tcW")
-            tcW.set(qn("w:w"),    str(w * 10))   # twips * 10 = DXA units approx
-            tcW.set(qn("w:type"), "dxa")
-            tcPr.append(tcW)
-
     # ── Column header row ────────────────────────────────────────────────────
     hrow = table.add_row()
-    set_row_widths(hrow)
+    set_row_widths(hrow, COL_WIDTHS)
     for cell, label in zip(hrow.cells,
-                           ["Time Code In", "Time Code Out", "Duration", "SCRIPT & VO"]):
-        set_bg(cell, "BDD7EE")
-        set_borders(cell, "AAAAAA")
+                           ["Time Code In", "Time Code Out",
+                            "Duration", "SCRIPT & VO"]):
+        set_borders(cell)
         cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
         p = cell.paragraphs[0]
         p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        add_run(p, label, bold=True, size=8)
+        add_run(p, label, bold=True, size=10)
+
+    # ── Helper: merged full-width label row ───────────────────────────────────
+    def add_label_row(text, fill_hex, bold=False, italic=False, color=None):
+        row = table.add_row()
+        set_row_widths(row, COL_WIDTHS)
+        row.cells[0].merge(row.cells[3])
+        c = row.cells[0]
+        set_bg(c, fill_hex)
+        set_borders(c, "AAAAAA")
+        c.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
+        p = c.paragraphs[0]
+        add_run(p, text, bold=bold, italic=italic,
+                color=color, size=10)
+
+    # ── Classify label row colour by content ──────────────────────────────────
+    import re as _re
+    def label_fill(text):
+        t = text.upper().strip()
+        if _re.match('^ACT\\s+\\d+', t):
+            return "FBE5D5"   # peach — ACT 2, ACT 3...
+        if any(kw in t for kw in ["PART BREAK", "TITLES", "COLD OPEN",
+                                   "TEASER", "TAG", "END OF SHOW"]):
+            return "E2EFD9"   # green
+        return "DEEBF6"       # blue — story segment name (default)
 
     # ── Data rows ────────────────────────────────────────────────────────────
     for line in matched_lines:
@@ -415,84 +433,62 @@ def build_output_docx(matched_lines, output_path, fps):
         dur     = line.get("dur",     "")
         speaker = line.get("speaker")
 
-        # ── Section / story beat label ────────────────────────────────────
-        # Kept as a plain label row — no TC, light tint to distinguish
+        # ── Section / part / label rows ───────────────────────────────────
         if ltype in ("section", "part"):
-            row = table.add_row()
-            set_row_widths(row)
-            # Merge all 4 cells
-            row.cells[0].merge(row.cells[3])
-            c = row.cells[0]
-            set_bg(c, "E8E8E8")
-            set_borders(c, "BBBBBB")
-            c.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-            p = c.paragraphs[0]
-            add_run(p, text.upper(), bold=False, size=8, color="#777777")
+            add_label_row(text, label_fill(text))
             continue
 
         # ── Coda card ─────────────────────────────────────────────────────
         if ltype == "coda":
-            row = table.add_row()
-            set_row_widths(row)
-            row.cells[0].merge(row.cells[3])
-            c = row.cells[0]
-            set_bg(c, "EEEEEE")
-            set_borders(c, "AAAAAA")
-            p = c.paragraphs[0]
-            add_run(p, "[CODA]  ", bold=True, size=8, color="#888888")
-            for part in text.split(" / "):
-                add_run(p, part.strip() + "  ", italic=True,
-                        size=9, color="#444444")
+            add_label_row(f"[CODA]  {text}", "E2EFD9", italic=True, color="#555555")
             continue
 
         # ── VO row ────────────────────────────────────────────────────────
         if ltype == "vo":
             row = table.add_row()
-            set_row_widths(row)
+            set_row_widths(row, COL_WIDTHS)
 
-            # TC cells — filled with timecodes
             for cell, val in zip(row.cells[:3], [tc_in, tc_out, dur]):
                 set_borders(cell)
                 cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
                 p = cell.paragraphs[0]
-                add_run(p, val, mono=True, size=9)
+                add_run(p, val, mono=True, size=10)
 
-            # Script cell
             sc = row.cells[3]
             set_borders(sc)
             sc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
             p = sc.paragraphs[0]
-            add_run(p, "VO:", bold=True, size=9)
+            add_run(p, "VO:", bold=True, size=10)
+            # VO text on next paragraph, bold uppercase
             p2 = sc.add_paragraph()
             for part in text.split(" / "):
-                add_run(p2, part.strip() + "  ", bold=True, size=10)
+                add_run(p2, part.strip() + " ", bold=True, size=10)
             continue
 
-        # ── Actuality row ─────────────────────────────────────────────────
-        # TC cells are BLANK — matches reference format exactly
+        # ── Actuality row — TC cells BLANK, grey background ───────────────
         row = table.add_row()
-        set_row_widths(row)
+        set_row_widths(row, COL_WIDTHS)
 
-        for cell in row.cells[:3]:
+        for cell in row.cells[:4]:   # grey ALL cells including script col
+            set_bg(cell, "E7E6E6")
             set_borders(cell)
             cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-            cell.paragraphs[0].clear()  # explicitly empty
+
+        # TC cells explicitly empty
+        for cell in row.cells[:3]:
+            cell.paragraphs[0].clear()
 
         sc = row.cells[3]
-        set_borders(sc)
-        sc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-
         p = sc.paragraphs[0]
-        add_run(p, "Actuality:", bold=False, italic=True, size=9)
+        add_run(p, "Actuality:", italic=True, size=10)
 
         if speaker:
             p2 = sc.add_paragraph()
-            add_run(p2, speaker, bold=True, size=9)
+            add_run(p2, speaker, bold=True, size=10)
 
-        # Dialogue — split on " / " markers (how parser joins multiple lines)
         p3 = sc.add_paragraph()
         for part in text.split(" / "):
-            add_run(p3, part.strip() + "  ", italic=True, size=9)
+            add_run(p3, part.strip() + " ", italic=True, size=10)
 
     doc.save(str(output_path))
 
@@ -698,9 +694,6 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
 # ─────────────────────────────────────────────────────────────────────────────
 # Flask routes
 # ─────────────────────────────────────────────────────────────────────────────
-
-import csv
-from datetime import datetime, timezone
 
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pp_timecoder_uploads"
 OUTPUT_DIR = Path(tempfile.gettempdir()) / "pp_timecoder_outputs"
