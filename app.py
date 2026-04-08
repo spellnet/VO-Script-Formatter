@@ -139,13 +139,34 @@ def parse_source_script(docx_path):
             i += 1
         return results
 
-    for table in doc.tables:
+    # Find the script table by looking for TC column headers.
+    # This skips the production info table at the top of Stampede scripts.
+    TC_KEYWORDS = {"time code", "timecode", "tc in", "tc out", "duration"}
+    SCRIPT_TABLE_IDX = None
+    for tidx, table in enumerate(doc.tables):
+        if not table.rows:
+            continue
+        first_row_text = " ".join(
+            c.text.strip().lower() for c in table.rows[0].cells
+        )
+        if any(kw in first_row_text for kw in TC_KEYWORDS):
+            SCRIPT_TABLE_IDX = tidx
+            break
+
+    tables_to_parse = (
+        [doc.tables[SCRIPT_TABLE_IDX]] if SCRIPT_TABLE_IDX is not None
+        else doc.tables   # fallback: parse all if no TC table found
+    )
+
+    for table in tables_to_parse:
         for row in table.rows:
             if not row.cells:
                 continue
             cell = row.cells[-1] if len(row.cells) >= 2 else row.cells[0]
             ct   = cell.text.strip().upper()
-            if ct in ("SCRIPT & VO", "SCRIPT", "VO", "CONTENT", ""):
+            if ct in ("SCRIPT & VO", "SCRIPT", "VO", "CONTENT", "",
+                      "TIME CODE IN", "TIME CODE OUT", "DURATION",
+                      "TC IN", "TC OUT"):
                 continue
             lines.extend(classify_cell(cell))
 
@@ -227,33 +248,37 @@ def transcribe_openai(audio_path, api_key):
 
 def match_timecodes(script_lines, segments, tc_offset_secs, fps):
     """
-    Forward-pass fuzzy matching of script lines to Whisper segments.
+    Two-pass matching strategy:
 
-    Key fixes vs previous version:
-    - Cursor advances PAST the matched segment after each hit, so the same
-      segment can never be reused for the next line (fixes "all same TC" bug)
-    - Lower threshold (0.18) so more VO lines get matched even when Whisper
-      picks up narration imperfectly through music beds
-    - Wider lookahead (80 segs) to handle longer gaps between VO lines
-    - Falls back to best available match if nothing meets threshold, provided
-      the score is at least 0.10 -- leaves blank only if truly no signal at all
+    PASS 1 — Text matching (forward pass)
+    For each VO line, search the next N Whisper segments for the best
+    fuzzy text match. Threshold is low (0.15) since VO narration over
+    music often transcribes imperfectly.
+
+    PASS 2 — Time-distribution interpolation
+    For lines that got no match in pass 1, estimate their TC by
+    interpolating between the nearest matched neighbours. This gives a
+    useful approximate TC even when Whisper can't hear the VO clearly.
+    Interpolated TCs are prefixed with ~ so the editor knows to check them.
     """
     if not segments:
         return [{**l, "tc_in": "", "tc_out": "", "dur": ""} for l in script_lines]
 
-    results    = []
-    seg_cursor = 0
-    WINDOW     = 10   # max consecutive segments to join when matching
-    LOOKAHEAD  = 80   # how far ahead to search from current cursor
-    THRESHOLD  = 0.18 # accept match above this score
-    FALLBACK   = 0.10 # use best-effort match above this if nothing hits threshold
+    # ── Pass 1: text matching ─────────────────────────────────────────────────
     n_segs     = len(segments)
+    seg_cursor = 0
+    WINDOW     = 10
+    LOOKAHEAD  = 100
+    THRESHOLD  = 0.15
+    FALLBACK   = 0.08
 
+    results = []
     for line in script_lines:
         text = line.get("text", "").strip()
 
         if line["type"] in ("section", "part", "coda") or not text:
-            results.append({**line, "tc_in": "", "tc_out": "", "dur": ""})
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                            "_matched": False, "_seg_start": None})
             continue
 
         norm_line  = normalize(text)
@@ -267,15 +292,13 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                 joined      = (joined + " " + segments[j]["text"]).strip()
                 norm_joined = normalize(joined)
                 score       = similarity(norm_line, norm_joined)
-                # Boost score if script text is a substring of the transcript
-                if len(norm_line) > 8 and norm_line in norm_joined:
-                    score = max(score, 0.75)
+                if len(norm_line) > 6 and norm_line in norm_joined:
+                    score = max(score, 0.80)
                 if score > best_score:
                     best_score = score
                     best_i, best_j = i, j
 
         if best_score >= THRESHOLD and best_i is not None:
-            # Advance cursor PAST the matched segment so it cannot repeat
             seg_cursor = best_j + 1
             t_in  = segments[best_i]["start"]
             t_out = segments[best_j]["end"]
@@ -284,10 +307,11 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                 "tc_in":  seconds_to_tc(t_in,  tc_offset_secs, fps),
                 "tc_out": seconds_to_tc(t_out, tc_offset_secs, fps),
                 "dur":    dur_str(t_out - t_in),
+                "_matched":   True,
+                "_t_in":      t_in,
+                "_t_out":     t_out,
             })
         elif best_score >= FALLBACK and best_i is not None:
-            # Best-effort: use the match but flag it with a ~ prefix so the
-            # editor knows it needs checking
             seg_cursor = best_j + 1
             t_in  = segments[best_i]["start"]
             t_out = segments[best_j]["end"]
@@ -296,10 +320,66 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                 "tc_in":  "~" + seconds_to_tc(t_in,  tc_offset_secs, fps),
                 "tc_out": "~" + seconds_to_tc(t_out, tc_offset_secs, fps),
                 "dur":    dur_str(t_out - t_in),
+                "_matched":   True,
+                "_t_in":      t_in,
+                "_t_out":     t_out,
             })
         else:
-            results.append({**line, "tc_in": "", "tc_out": "", "dur": ""})
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                            "_matched": False, "_t_in": None, "_t_out": None})
 
+    # ── Pass 2: interpolate unmatched VO lines ────────────────────────────────
+    # Build index of matched positions (index → raw seconds)
+    total_audio = segments[-1]["end"] if segments else 0.0
+
+    # Find anchor points: (result_index, t_in_seconds)
+    anchors = []
+    for i, r in enumerate(results):
+        if r.get("_matched") and r.get("_t_in") is not None:
+            anchors.append((i, r["_t_in"]))
+
+    # Add virtual anchors at start and end for boundary interpolation
+    anchors = [(- 1, 0.0)] + anchors + [(len(results), total_audio)]
+
+    for idx, r in enumerate(results):
+        if r.get("_matched") or r["type"] in ("section", "part", "coda") or not r.get("text"):
+            continue  # already matched or not a content line
+
+        # Find the surrounding anchors
+        prev_anchor = anchors[0]
+        next_anchor = anchors[-1]
+        for a in anchors:
+            if a[0] < idx:
+                prev_anchor = a
+            if a[0] > idx and next_anchor[0] >= len(results):
+                next_anchor = a
+                break
+            if a[0] > idx:
+                next_anchor = a
+                break
+
+        # Interpolate position within the anchor range
+        prev_i, prev_t = prev_anchor
+        next_i, next_t = next_anchor
+        span_lines = max(next_i - prev_i, 1)
+        span_time  = next_t - prev_t
+        frac       = (idx - prev_i) / span_lines
+        est_t_in   = prev_t + frac * span_time
+        est_t_out  = est_t_in + 5.0   # assume ~5s duration
+
+        results[idx]["tc_in"]  = "~" + seconds_to_tc(est_t_in,  tc_offset_secs, fps)
+        results[idx]["tc_out"] = "~" + seconds_to_tc(est_t_out, tc_offset_secs, fps)
+        results[idx]["dur"]    = dur_str(5.0)
+
+    # Clean up internal tracking keys before returning
+    for r in results:
+        r.pop("_matched", None)
+        r.pop("_t_in",    None)
+        r.pop("_t_out",   None)
+
+    n_matched = sum(1 for r in results if r["tc_in"] and not r["tc_in"].startswith("~"))
+    n_interp  = sum(1 for r in results if r.get("tc_in", "").startswith("~"))
+    print(f"Match stats: {n_matched} confirmed, {n_interp} interpolated (~)")
     return results
 
 
