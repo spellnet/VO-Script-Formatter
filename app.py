@@ -291,39 +291,49 @@ def transcribe_openai(audio_path, api_key):
 
 def match_timecodes(script_lines, segments, tc_offset_secs, fps):
     """
-    Two-pass matching strategy:
+    Actuality-anchored matching strategy:
 
-    PASS 1 — Text matching (forward pass)
-    For each VO line, search the next N Whisper segments for the best
-    fuzzy text match. Threshold is low (0.15) since VO narration over
-    music often transcribes imperfectly.
+    1. Match ACTUALITY lines to Whisper segments (dialogue is clearly audible).
+    2. Use matched actualities as TC anchors throughout the script.
+    3. Interpolate VO lines between their surrounding actuality anchors.
 
-    PASS 2 — Time-distribution interpolation
-    For lines that got no match in pass 1, estimate their TC by
-    interpolating between the nearest matched neighbours. This gives a
-    useful approximate TC even when Whisper can't hear the VO clearly.
-    Interpolated TCs are prefixed with ~ so the editor knows to check them.
+    This works because VO narration is often over music/title cards and
+    Whisper cannot reliably transcribe it, whereas on-screen dialogue
+    (actuality) is clearly audible and matches well.
+
+    Confirmed actuality TCs have no prefix.
+    Interpolated VO TCs are prefixed with ~ to flag for review.
     """
     if not segments:
         return [{**l, "tc_in": "", "tc_out": "", "dur": ""} for l in script_lines]
 
-    # ── Pass 1: text matching ─────────────────────────────────────────────────
     n_segs     = len(segments)
     seg_cursor = 0
-    WINDOW     = 10
-    LOOKAHEAD  = 100
-    THRESHOLD  = 0.15
-    FALLBACK   = 0.08
+    WINDOW     = 12
+    LOOKAHEAD  = 120
+    THRESHOLD  = 0.20
+    FALLBACK   = 0.10
+    total_audio = segments[-1]["end"]
 
+    # ── Pass 1: match actuality lines only ───────────────────────────────────
     results = []
     for line in script_lines:
-        text = line.get("text", "").strip()
+        ltype = line.get("type", "act")
+        text  = line.get("text", "").strip()
 
-        if line["type"] in ("section", "part", "coda") or not text:
+        # Section headers — no TC
+        if ltype in ("section", "part", "coda") or not text:
             results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
-                            "_matched": False, "_seg_start": None})
+                            "_t_in": None, "_t_out": None, "_matched": False})
             continue
 
+        # VO lines — skip in pass 1, will be interpolated in pass 2
+        if ltype == "vo":
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                            "_t_in": None, "_t_out": None, "_matched": False})
+            continue
+
+        # Actuality — try to match
         norm_line  = normalize(text)
         best_score = 0.0
         best_i = best_j = None
@@ -336,7 +346,7 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                 norm_joined = normalize(joined)
                 score       = similarity(norm_line, norm_joined)
                 if len(norm_line) > 6 and norm_line in norm_joined:
-                    score = max(score, 0.80)
+                    score = max(score, 0.85)
                 if score > best_score:
                     best_score = score
                     best_i, best_j = i, j
@@ -350,9 +360,9 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                 "tc_in":  seconds_to_tc(t_in,  tc_offset_secs, fps),
                 "tc_out": seconds_to_tc(t_out, tc_offset_secs, fps),
                 "dur":    dur_str(t_out - t_in),
-                "_matched":   True,
-                "_t_in":      t_in,
-                "_t_out":     t_out,
+                "_t_in":    t_in,
+                "_t_out":   t_out,
+                "_matched": True,
             })
         elif best_score >= FALLBACK and best_i is not None:
             seg_cursor = best_j + 1
@@ -363,67 +373,74 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
                 "tc_in":  "~" + seconds_to_tc(t_in,  tc_offset_secs, fps),
                 "tc_out": "~" + seconds_to_tc(t_out, tc_offset_secs, fps),
                 "dur":    dur_str(t_out - t_in),
-                "_matched":   True,
-                "_t_in":      t_in,
-                "_t_out":     t_out,
+                "_t_in":    t_in,
+                "_t_out":   t_out,
+                "_matched": True,
             })
         else:
             results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
-                            "_matched": False, "_t_in": None, "_t_out": None})
+                            "_t_in": None, "_t_out": None, "_matched": False})
 
-    # ── Pass 2: interpolate unmatched VO lines ────────────────────────────────
-    # Build index of matched positions (index → raw seconds)
-    total_audio = segments[-1]["end"] if segments else 0.0
-
-    # Find anchor points: (result_index, t_in_seconds)
-    anchors = []
+    # ── Pass 2: place VO lines between actuality anchors ─────────────────────
+    # Build list of (index, t_in) for every line that has a real timestamp
+    anchors = [(-1, 0.0)]
     for i, r in enumerate(results):
-        if r.get("_matched") and r.get("_t_in") is not None:
+        if r.get("_t_in") is not None:
             anchors.append((i, r["_t_in"]))
-
-    # Add virtual anchors at start and end for boundary interpolation
-    anchors = [(- 1, 0.0)] + anchors + [(len(results), total_audio)]
+    anchors.append((len(results), total_audio))
 
     for idx, r in enumerate(results):
-        if r.get("_matched") or r["type"] in ("section", "part", "coda") or not r.get("text"):
-            continue  # already matched or not a content line
+        ltype = r.get("type", "act")
+        if r.get("_t_in") is not None:
+            continue   # already has a TC
+        if ltype in ("section", "part", "coda") or not r.get("text"):
+            continue   # no TC for headers
 
-        # Find the surrounding anchors
-        prev_anchor = anchors[0]
-        next_anchor = anchors[-1]
+        # Find surrounding anchors
+        prev_a = anchors[0]
+        next_a = anchors[-1]
         for a in anchors:
             if a[0] < idx:
-                prev_anchor = a
-            if a[0] > idx and next_anchor[0] >= len(results):
-                next_anchor = a
-                break
-            if a[0] > idx:
-                next_anchor = a
+                prev_a = a
+            elif a[0] > idx:
+                next_a = a
                 break
 
-        # Interpolate position within the anchor range
-        prev_i, prev_t = prev_anchor
-        next_i, next_t = next_anchor
+        prev_i, prev_t = prev_a
+        next_i, next_t = next_a
         span_lines = max(next_i - prev_i, 1)
-        span_time  = next_t - prev_t
+        span_time  = max(next_t - prev_t, 0.0)
         frac       = (idx - prev_i) / span_lines
-        est_t_in   = prev_t + frac * span_time
-        est_t_out  = est_t_in + 5.0   # assume ~5s duration
+        est_in     = prev_t + frac * span_time
 
-        results[idx]["tc_in"]  = "~" + seconds_to_tc(est_t_in,  tc_offset_secs, fps)
-        results[idx]["tc_out"] = "~" + seconds_to_tc(est_t_out, tc_offset_secs, fps)
-        results[idx]["dur"]    = dur_str(5.0)
+        # Estimate duration: typical VO line ~3-8 seconds
+        # Use available gap divided by number of VO lines in this block
+        vo_in_block = sum(
+            1 for r2 in results[prev_i+1:next_i]
+            if r2.get("type") == "vo" and r2.get("_t_in") is None
+        )
+        est_dur = min(span_time / max(vo_in_block, 1), 8.0) if span_time > 0 else 4.0
+        est_out = min(est_in + est_dur, next_t)
 
-    # Clean up internal tracking keys before returning
+        results[idx]["tc_in"]  = "~" + seconds_to_tc(est_in,  tc_offset_secs, fps)
+        results[idx]["tc_out"] = "~" + seconds_to_tc(est_out, tc_offset_secs, fps)
+        results[idx]["dur"]    = dur_str(est_out - est_in)
+        results[idx]["_t_in"]  = est_in
+
+    # Clean internal keys
+    n_act_matched = sum(1 for r in results
+                        if r.get("_matched") and r["type"] == "act")
+    n_vo_interp   = sum(1 for r in results
+                        if r.get("type") == "vo" and r.get("tc_in","").startswith("~"))
+    n_vo_blank    = sum(1 for r in results
+                        if r.get("type") == "vo" and not r.get("tc_in"))
     for r in results:
-        r.pop("_matched", None)
-        r.pop("_t_in",    None)
-        r.pop("_t_out",   None)
+        r.pop("_matched", None); r.pop("_t_in", None); r.pop("_t_out", None)
 
-    n_matched = sum(1 for r in results if r["tc_in"] and not r["tc_in"].startswith("~"))
-    n_interp  = sum(1 for r in results if r.get("tc_in", "").startswith("~"))
-    print(f"Match stats: {n_matched} confirmed, {n_interp} interpolated (~)")
+    print(f"Match: {n_act_matched} actualities matched | "
+          f"{n_vo_interp} VO interpolated | {n_vo_blank} blank")
     return results
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
