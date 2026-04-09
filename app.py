@@ -1052,14 +1052,12 @@ def build_output_xlsx(matched_lines, output_path, fps):
                 if col == 4:
                     cell.font = Font(name="Calibri", size=10, bold=True)
                 elif col in (1, 2, 3):
-                    cell.font = Font(name="Calibri", size=10,
-                                     name_="Courier New" or "Calibri")
                     cell.font = Font(name="Courier New", size=10)
                 else:
-                    cell.font = font(italic=bool(notes and
-                                     notes.startswith("⚠")),
-                                     color="CC0000" if notes and
-                                     notes.startswith("⚠ WORDING") else "000000")
+                    is_warn   = bool(notes and "WORDING" in notes)
+                    cell.font = Font(name="Calibri", size=10,
+                                     italic=is_warn,
+                                     color="CC0000" if is_warn else "000000")
 
             # Highlight wording warnings in red
             if notes and "WORDING" in notes:
