@@ -285,6 +285,127 @@ def compress_audio(wav_path, out_mp3):
         raise RuntimeError(f"ffmpeg compress failed:\n{result.stderr[-400:]}")
     return out_mp3
 
+# ─────────────────────────────────────────────────────────────────────────────
+# EDL parser  (CMX 3600)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_edl(edl_path, fps=25):
+    """
+    Parse a CMX 3600 EDL file. Returns list of events in sequence order:
+      { "event": int, "reel": str, "tc_in": str, "tc_out": str,
+        "rec_in": str, "rec_out": str, "clip_name": str }
+
+    tc_in/tc_out  = source timecode
+    rec_in/rec_out = record (programme) timecode  ← this is what we want
+    """
+    events = []
+    current = {}
+
+    EDL_EVENT   = re.compile(
+        r'^\s*(\d+)\s+(\S+)\s+\S+\s+\S+\s+'
+        r'(\d{2}:\d{2}:\d{2}[:\;]\d{2})\s+'
+        r'(\d{2}:\d{2}:\d{2}[:\;]\d{2})\s+'
+        r'(\d{2}:\d{2}:\d{2}[:\;]\d{2})\s+'
+        r'(\d{2}:\d{2}:\d{2}[:\;]\d{2})')
+    CLIP_NAME   = re.compile(r'\*\s*(?:FROM CLIP NAME|CLIP NAME)\s*:\s*(.+)', re.IGNORECASE)
+    LOC_NAME    = re.compile(r'\*\s*LOC\s*:\S+\s+\S+\s+(.+)', re.IGNORECASE)
+
+    with open(edl_path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.rstrip()
+
+            m = EDL_EVENT.match(line)
+            if m:
+                if current:
+                    events.append(current)
+                current = {
+                    "event":     int(m.group(1)),
+                    "reel":      m.group(2),
+                    "src_in":    m.group(3).replace(";", ":"),
+                    "src_out":   m.group(4).replace(";", ":"),
+                    "rec_in":    m.group(5).replace(";", ":"),
+                    "rec_out":   m.group(6).replace(";", ":"),
+                    "clip_name": "",
+                }
+                continue
+
+            # Clip name comment lines
+            m = CLIP_NAME.match(line)
+            if m and current:
+                current["clip_name"] = m.group(1).strip()
+                continue
+
+            m = LOC_NAME.match(line)
+            if m and current:
+                if not current.get("clip_name"):
+                    current["clip_name"] = m.group(1).strip()
+
+    if current:
+        events.append(current)
+
+    # Remove duplicates (Avid sometimes outputs the same event twice)
+    seen = set()
+    unique = []
+    for e in events:
+        key = e["rec_in"]
+        if key not in seen:
+            seen.add(key)
+            unique.append(e)
+
+    return sorted(unique, key=lambda e: e["rec_in"])
+
+
+def match_from_edl(script_lines, edl_events, fps):
+    """
+    Match VO lines to EDL events by sequence order.
+    EDL event 1 → first VO line in script, event 2 → second VO line, etc.
+    Actuality lines get blank TCs (not needed).
+    """
+    results   = []
+    vo_lines  = [i for i, l in enumerate(script_lines) if l.get("type") == "vo"]
+    edl_idx   = 0
+
+    for i, line in enumerate(script_lines):
+        ltype = line.get("type", "act")
+        text  = line.get("text", "")
+
+        if ltype in ("section", "part", "coda") or not text:
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": ""})
+            continue
+
+        if ltype != "vo":
+            # Actuality — blank TC, reference only
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": ""})
+            continue
+
+        # VO line — assign next EDL event in sequence
+        if edl_idx < len(edl_events):
+            ev     = edl_events[edl_idx]
+            tc_in  = ev["rec_in"]
+            tc_out = ev["rec_out"]
+            # Calculate duration in seconds
+            def tc_secs(tc):
+                p = tc.replace(";",":").split(":")
+                return int(p[0])*3600 + int(p[1])*60 + int(p[2]) + int(p[3])/fps
+            dur_secs = max(tc_secs(tc_out) - tc_secs(tc_in), 0)
+            results.append({
+                **line,
+                "tc_in":  tc_in,
+                "tc_out": tc_out,
+                "dur":    dur_str(dur_secs),
+            })
+            edl_idx += 1
+        else:
+            # More VO lines than EDL events
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": ""})
+
+    matched = sum(1 for r in results if r.get("tc_in") and r.get("type") == "vo")
+    total_vo = sum(1 for l in script_lines if l.get("type") == "vo")
+    print(f"EDL match: {matched} / {total_vo} VO lines assigned from {len(edl_events)} EDL events")
+    return results
+
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Whisper API transcription
@@ -608,213 +729,372 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
 # Output .docx builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_output_docx(matched_lines, output_path, fps):
+
+def match_three_input(script_lines, edl_events, audio_segments,
+                      tc_offset_secs, fps, log_fn=print):
     """
-    Build the VO recording script .docx matching the Stampede template exactly:
-    - Calibri 10pt throughout
-    - A4 page, 1-inch margins
-    - Column widths: 990 / 990 / 973 / 6241 DXA
-    - Story headers:  #DEEBF6 blue,  merged full width
-    - TITLES/PART BREAK: #E2EFD9 green, merged
-    - ACT rows:       #FBE5D5 peach, merged
-    - Actuality rows: #E7E6E6 grey, TC cells blank
-    - VO rows:        white,  TC cells filled
+    Three-input matching for VO lines:
+
+    1. EDL (primary)  — assign EDL events to VO lines by sequence order.
+                        Frame-accurate, no wording comparison needed.
+    2. Audio fallback — for VO lines with no EDL event, try Whisper transcript.
+                        Also used to verify wording of EDL-matched lines.
+    3. Wording check  — if Whisper heard something >15% different from the
+                        script, add a note flagging the discrepancy.
+
+    Actuality lines always get blank TCs.
+    Interpolation fills remaining blanks between confirmed anchors.
     """
-    from docx import Document
-    from docx.shared import Pt, RGBColor, Inches, Cm
-    from docx.oxml.ns import qn
-    from docx.oxml import OxmlElement
-    from docx.enum.text import WD_ALIGN_PARAGRAPH
-    from docx.enum.table import WD_ALIGN_VERTICAL
+    WORDING_THRESHOLD = 0.15   # flag if similarity < (1 - 0.15) = 0.85
 
-    # ── Column widths (DXA) ──────────────────────────────────────────────────
-    # Widths sized for HH:MM:SS:FF (11 chars Courier New 10pt) + cell padding
-    # Total kept at 9194 DXA to match original template table width
-    W_TC1 = 1440   # 1 inch — fits HH:MM:SS:FF without wrapping
-    W_TC2 = 1440   # 1 inch
-    W_DUR = 1440   # 1 inch
-    W_SCR = 4874   # remaining — ~3.4 inches for script text
+    results  = []
+    edl_idx  = 0
 
-    doc     = Document()
-    sec     = doc.sections[0]
-    sec.page_width    = Inches(8.27)   # A4
-    sec.page_height   = Inches(11.69)  # A4
-    sec.left_margin   = Inches(1.0)
-    sec.right_margin  = Inches(1.0)
-    sec.top_margin    = Inches(1.0)
-    sec.bottom_margin = Inches(1.0)
+    # ── Flatten audio segments for fallback matching ──────────────────────────
+    if isinstance(audio_segments, dict):
+        # Stereo: use VO channel for VO, dial channel for actuality
+        vo_segs   = audio_segments.get("vo",   [])
+        dial_segs = audio_segments.get("dial", [])
+    elif audio_segments:
+        # Mono: use same pool for both
+        vo_segs   = audio_segments
+        dial_segs = audio_segments
+    else:
+        vo_segs   = []
+        dial_segs = []
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    vo_cursor   = 0
+    WINDOW      = 12
+    LOOKAHEAD   = 120
+    THRESHOLD   = 0.20
+    n_segs_vo   = len(vo_segs)
+    total_audio = (vo_segs[-1]["end"] if vo_segs
+                   else dial_segs[-1]["end"] if dial_segs else 0.0)
 
-    def set_cell_width(cell, dxa):
-        tc   = cell._tc
-        tcPr = tc.get_or_add_tcPr()
-        # Remove existing width if present
-        for old in tcPr.findall(qn("w:tcW")):
-            tcPr.remove(old)
-        tcW = OxmlElement("w:tcW")
-        tcW.set(qn("w:w"),    str(dxa))
-        tcW.set(qn("w:type"), "dxa")
-        tcPr.append(tcW)
+    def best_audio_match(norm_text, seg_list, cursor):
+        n = len(seg_list)
+        best_score = 0.0
+        best_i = best_j = None
+        end = min(cursor + LOOKAHEAD, n)
+        for i in range(cursor, end):
+            joined = ""
+            for j in range(i, min(i + WINDOW, end)):
+                joined      = (joined + " " + seg_list[j]["text"]).strip()
+                norm_joined = normalize(joined)
+                score       = similarity(norm_text, norm_joined)
+                if len(norm_text) > 6 and norm_text in norm_joined:
+                    score = max(score, 0.85)
+                if score > best_score:
+                    best_score = score
+                    best_i, best_j = i, j
+        return best_score, best_i, best_j
 
-    def set_bg(cell, hex_color):
-        tc   = cell._tc
-        tcPr = tc.get_or_add_tcPr()
-        shd  = OxmlElement("w:shd")
-        shd.set(qn("w:val"),   "clear")
-        shd.set(qn("w:color"), "auto")
-        shd.set(qn("w:fill"),  hex_color.upper().replace("#", ""))
-        tcPr.append(shd)
+    def audio_text_for(bi, bj, seg_list):
+        """Reconstruct what Whisper heard for a matched span."""
+        return " ".join(seg_list[k]["text"].strip()
+                        for k in range(bi, bj + 1)).strip()
 
-    def set_borders(cell, color="AAAAAA"):
-        tc   = cell._tc
-        tcPr = tc.get_or_add_tcPr()
-        tcB  = OxmlElement("w:tcBorders")
-        for side in ("top", "left", "bottom", "right"):
-            t = OxmlElement(f"w:{side}")
-            t.set(qn("w:val"),   "single")
-            t.set(qn("w:sz"),    "4")
-            t.set(qn("w:color"), color)
-            tcB.append(t)
-        tcPr.append(tcB)
+    # ── Main pass ─────────────────────────────────────────────────────────────
+    for line in script_lines:
+        ltype  = line.get("type", "act")
+        text   = line.get("text", "").strip()
 
-    def add_run(para, text, bold=False, italic=False,
-                color=None, size=10, mono=False):
-        """Add a run. Font: Calibri 10pt by default."""
-        r = para.add_run(text)
-        r.bold      = bold
-        r.italic    = italic
-        r.font.size = Pt(size)
-        r.font.name = "Courier New" if mono else "Calibri"
-        if color:
-            rgb = tuple(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4))
-            r.font.color.rgb = RGBColor(*rgb)
+        # Headers / coda — no TC
+        if ltype in ("section", "part", "coda") or not text:
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                            "notes": "", "_t_in": None})
+            continue
 
-    def set_row_widths(row, widths):
-        for cell, w in zip(row.cells, widths):
-            set_cell_width(cell, w)
+        # Actuality — no TC, reference only
+        if ltype != "vo":
+            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
+                            "notes": "", "_t_in": None})
+            continue
 
-    COL_WIDTHS = [W_TC1, W_TC2, W_DUR, W_SCR]
+        # ── VO line: try EDL first ────────────────────────────────────────
+        note = ""
+        tc_in = tc_out = dur = ""
+        t_in_raw = None
 
-    # ── Title block (above table) ─────────────────────────────────────────────
-    tp = doc.add_paragraph()
-    add_run(tp, "STAMPEDE PRODUCTIONS", bold=True, size=12)
-    tp2 = doc.add_paragraph()
-    add_run(tp2, "VO SCRIPT  —  AUTO FORMATTED", bold=True, size=10)
-    tp3 = doc.add_paragraph()
-    add_run(tp3,
-        f"TC: HH:MM:SS:FF  ·  {fps}fps  ·  "
-        "Actuality rows shown for reference only — timecodes on VO lines",
-        italic=True, size=9, color="#888888")
-    doc.add_paragraph()
+        if edl_idx < len(edl_events):
+            ev     = edl_events[edl_idx]
+            tc_in  = ev["rec_in"]
+            tc_out = ev["rec_out"]
+            def tc_s(tc):
+                p = tc.replace(";",":").split(":")
+                return int(p[0])*3600+int(p[1])*60+int(p[2])+int(p[3])/fps
+            dur_secs  = max(tc_s(tc_out) - tc_s(tc_in), 0)
+            dur       = dur_str(dur_secs)
+            t_in_raw  = tc_s(tc_in)
+            edl_idx  += 1
 
-    # ── Table ────────────────────────────────────────────────────────────────
-    table = doc.add_table(rows=0, cols=4)
-    table.style = "Table Grid"
+            # Wording check against audio if available
+            if vo_segs:
+                norm_script = normalize(text)
+                score, bi, bj = best_audio_match(
+                    norm_script, vo_segs, vo_cursor)
+                if score >= 0.20 and bi is not None:
+                    vo_cursor = bj + 1
+                    heard = audio_text_for(bi, bj, vo_segs)
+                    sim   = similarity(norm_script, normalize(heard))
+                    if sim < (1 - WORDING_THRESHOLD):
+                        script_snippet = text[:60] + ("..." if len(text) > 60 else "")
+                        heard_snippet  = heard[:60] + ("..." if len(heard) > 60 else "")
+                        note = f"WORDING: script: {script_snippet!r} | audio: {heard_snippet!r}"
 
-    # ── Column header row ────────────────────────────────────────────────────
-    hrow = table.add_row()
-    set_row_widths(hrow, COL_WIDTHS)
-    for cell, label in zip(hrow.cells,
-                           ["Time Code In", "Time Code Out",
-                            "Duration", "SCRIPT & VO"]):
-        set_borders(cell)
-        cell.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        p = cell.paragraphs[0]
-        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        add_run(p, label, bold=True, size=10)
+        elif vo_segs:
+            # No EDL event — fall back to audio
+            norm_script = normalize(text)
+            score, bi, bj = best_audio_match(
+                norm_script, vo_segs, vo_cursor)
+            if score >= THRESHOLD and bi is not None:
+                vo_cursor = bj + 1
+                t_in_raw  = vo_segs[bi]["start"]
+                t_out_raw = vo_segs[bj]["end"]
+                tc_in     = "~" + seconds_to_tc(t_in_raw, tc_offset_secs, fps)
+                tc_out    = "~" + seconds_to_tc(t_out_raw, tc_offset_secs, fps)
+                dur       = dur_str(t_out_raw - t_in_raw)
+                note      = "TC from audio (no EDL event)"
+            else:
+                note = "NOT FOUND IN EDL OR AUDIO"
+        else:
+            note = "NOT FOUND — no EDL event and no audio provided"
 
-    # ── Helper: merged full-width label row ───────────────────────────────────
-    def add_label_row(text, fill_hex, bold=False, italic=False, color=None):
-        row = table.add_row()
-        set_row_widths(row, COL_WIDTHS)
-        row.cells[0].merge(row.cells[3])
-        c = row.cells[0]
-        set_bg(c, fill_hex)
-        set_borders(c, "AAAAAA")
-        c.vertical_alignment = WD_ALIGN_VERTICAL.CENTER
-        p = c.paragraphs[0]
-        add_run(p, text, bold=bold, italic=italic,
-                color=color, size=10)
+        results.append({
+            **line,
+            "tc_in":  tc_in,
+            "tc_out": tc_out,
+            "dur":    dur,
+            "notes":  note,
+            "_t_in":  t_in_raw,
+        })
 
-    # ── Classify label row colour by content ──────────────────────────────────
+    # ── Interpolation pass for remaining blanks ───────────────────────────────
+    anchors = [(-1, 0.0)]
+    for i, r in enumerate(results):
+        if r.get("_t_in") is not None:
+            anchors.append((i, r["_t_in"]))
+    anchors.append((len(results), total_audio))
+
+    for idx, r in enumerate(results):
+        if r.get("_t_in") is not None:
+            continue
+        if r.get("type") in ("section","part","coda") or not r.get("text"):
+            continue
+        if r.get("type") != "vo":
+            continue
+        if "NOT FOUND" in r.get("notes",""):
+            continue   # leave as-is, already flagged
+
+        prev_a = anchors[0]; next_a = anchors[-1]
+        for a in anchors:
+            if a[0] < idx:   prev_a = a
+            elif a[0] > idx: next_a = a; break
+        prev_i, prev_t = prev_a
+        next_i, next_t = next_a
+        frac    = (idx - prev_i) / max(next_i - prev_i, 1)
+        est_in  = prev_t + frac * (next_t - prev_t)
+        est_out = min(est_in + 4.0, next_t)
+        results[idx]["tc_in"]  = "~" + seconds_to_tc(est_in,  tc_offset_secs, fps)
+        results[idx]["tc_out"] = "~" + seconds_to_tc(est_out, tc_offset_secs, fps)
+        results[idx]["dur"]    = dur_str(est_out - est_in)
+        if not results[idx]["notes"]:
+            results[idx]["notes"] = "⚠ TC estimated — check against cut"
+        results[idx]["_t_in"] = est_in
+
+    # Summary
+    n_edl    = sum(1 for r in results if r.get("type")=="vo"
+                   and r.get("tc_in") and not r["tc_in"].startswith("~")
+                   and "NOT FOUND" not in r.get("notes",""))
+    n_audio  = sum(1 for r in results if r.get("type")=="vo"
+                   and r.get("tc_in","").startswith("~")
+                   and "audio" in r.get("notes",""))
+    n_interp = sum(1 for r in results if r.get("type")=="vo"
+                   and "estimated" in r.get("notes",""))
+    n_warn   = sum(1 for r in results if "WORDING" in r.get("notes",""))
+    n_miss   = sum(1 for r in results if "NOT FOUND" in r.get("notes",""))
+    log_fn(f"Match: {n_edl} EDL | {n_audio} audio | {n_interp} estimated "
+           f"| {n_warn} wording ⚠ | {n_miss} missing")
+
+    for r in results:
+        r.pop("_t_in", None)
+    return results
+
+
+def build_output_xlsx(matched_lines, output_path, fps):
+    """
+    Build the VO script as an Excel workbook.
+    Columns: TC In | TC Out | Duration | Script & VO | Notes
+    Colour coding:
+      #B8CCE4 — story/segment header (blue)
+      #BFBFBF — part/act break (mid grey)
+      #D9D9D9 — actuality (light grey)
+      white   — VO
+    Calibri 10pt throughout. Notes column blank for manual entry.
+    """
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "VO Script"
+
+    # ── Style helpers ────────────────────────────────────────────────────────
+    def font(bold=False, italic=False, color="000000"):
+        return Font(name="Calibri", size=10, bold=bold,
+                    italic=italic, color=color)
+
+    def fill(hex_color):
+        return PatternFill("solid", fgColor=hex_color.replace("#",""))
+
+    def border():
+        s = Side(style="thin", color="AAAAAA")
+        return Border(left=s, right=s, top=s, bottom=s)
+
+    def align(wrap=True, horizontal="left"):
+        return Alignment(wrap_text=wrap, vertical="top",
+                         horizontal=horizontal)
+
+    FILLS = {
+        "section": fill("B8CCE4"),
+        "part":    fill("BFBFBF"),
+        "act":     fill("D9D9D9"),
+        "vo":      fill("FFFFFF"),
+        "header":  fill("1F3864"),
+        "coda":    fill("E2EFD9"),
+    }
+
+    # ── Column widths (chars) ────────────────────────────────────────────────
+    ws.column_dimensions["A"].width = 15   # TC In
+    ws.column_dimensions["B"].width = 15   # TC Out
+    ws.column_dimensions["C"].width = 14   # Duration
+    ws.column_dimensions["D"].width = 60   # Script & VO
+    ws.column_dimensions["E"].width = 30   # Notes
+
+    # ── Header row ────────────────────────────────────────────────────────────
+    headers = ["TC IN", "TC OUT", "DURATION", "SCRIPT & VO", "NOTES"]
+    for col, h in enumerate(headers, 1):
+        cell = ws.cell(row=1, column=col, value=h)
+        cell.font      = Font(name="Calibri", size=10, bold=True, color="FFFFFF")
+        cell.fill      = FILLS["header"]
+        cell.border    = border()
+        cell.alignment = align(horizontal="center")
+    ws.row_dimensions[1].height = 18
+    ws.freeze_panes = "A2"
+
+    # ── Data rows ─────────────────────────────────────────────────────────────
+    row_num = 2
     import re as _re
-    def label_fill(text):
-        t = text.upper().strip()
-        if _re.match('^ACT\\s+\\d+', t):
-            return "FBE5D5"   # peach — ACT 2, ACT 3...
-        if any(kw in t for kw in ["PART BREAK", "TITLES", "COLD OPEN",
-                                   "TEASER", "TAG", "END OF SHOW"]):
-            return "E2EFD9"   # green
-        return "DEEBF6"       # blue — story segment name (default)
 
-    # ── Data rows ────────────────────────────────────────────────────────────
     for line in matched_lines:
         ltype   = line.get("type",    "act")
         text    = line.get("text",    "")
         tc_in   = line.get("tc_in",   "")
         tc_out  = line.get("tc_out",  "")
         dur     = line.get("dur",     "")
-        speaker = line.get("speaker")
+        speaker = line.get("speaker", "")
+        notes   = line.get("notes",   "")
 
-        # ── Section / part / label rows ───────────────────────────────────
-        if ltype in ("section", "part"):
-            add_label_row(text, label_fill(text))
+        # ── Section / story header ─────────────────────────────────────────
+        if ltype == "section":
+            ws.merge_cells(f"A{row_num}:E{row_num}")
+            cell = ws.cell(row=row_num, column=1, value=text.upper())
+            cell.font      = Font(name="Calibri", size=10, bold=True,
+                                  color="000000")
+            cell.fill      = FILLS["section"]
+            cell.border    = border()
+            cell.alignment = align(horizontal="left")
+            ws.row_dimensions[row_num].height = 16
+            row_num += 1
             continue
 
-        # ── Coda card ─────────────────────────────────────────────────────
+        # ── Part / act break ──────────────────────────────────────────────
+        if ltype == "part":
+            ws.merge_cells(f"A{row_num}:E{row_num}")
+            cell = ws.cell(row=row_num, column=1, value=text)
+            cell.font      = Font(name="Calibri", size=10, bold=True,
+                                  color="000000")
+            cell.fill      = FILLS["part"]
+            cell.border    = border()
+            cell.alignment = align(horizontal="left")
+            ws.row_dimensions[row_num].height = 16
+            row_num += 1
+            continue
+
+        # ── Coda ──────────────────────────────────────────────────────────
         if ltype == "coda":
-            add_label_row(f"[CODA]  {text}", "E2EFD9", italic=True, color="#555555")
+            ws.merge_cells(f"A{row_num}:E{row_num}")
+            cell = ws.cell(row=row_num, column=1, value=text)
+            cell.font      = font(italic=True, color="555555")
+            cell.fill      = FILLS["coda"]
+            cell.border    = border()
+            cell.alignment = align()
+            row_num += 1
             continue
 
         # ── VO row ────────────────────────────────────────────────────────
         if ltype == "vo":
-            row = table.add_row()
-            set_row_widths(row, COL_WIDTHS)
+            row_fill = FILLS["vo"]
+            # Strip ~ prefix for display, note it
+            display_in  = tc_in.lstrip("~")
+            display_out = tc_out.lstrip("~")
+            if tc_in.startswith("~") and not notes:
+                notes = "⚠ TC estimated — check against cut"
 
-            for cell, val in zip(row.cells[:3], [tc_in, tc_out, dur]):
-                set_borders(cell)
-                cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-                p = cell.paragraphs[0]
-                add_run(p, val, mono=True, size=10)
+            script_text = "VO:\n" + text.replace(" / ", "\n")
 
-            sc = row.cells[3]
-            set_borders(sc)
-            sc.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-            p = sc.paragraphs[0]
-            add_run(p, "VO:", bold=True, size=10)
-            # VO text on next paragraph, bold uppercase
-            p2 = sc.add_paragraph()
-            for part in text.split(" / "):
-                add_run(p2, part.strip() + " ", bold=True, size=10)
+            values = [display_in, display_out, dur, script_text, notes]
+            for col, val in enumerate(values, 1):
+                cell = ws.cell(row=row_num, column=col, value=val)
+                cell.fill      = row_fill
+                cell.border    = border()
+                cell.alignment = align()
+                if col == 4:
+                    cell.font = Font(name="Calibri", size=10, bold=True)
+                elif col in (1, 2, 3):
+                    cell.font = Font(name="Calibri", size=10,
+                                     name_="Courier New" or "Calibri")
+                    cell.font = Font(name="Courier New", size=10)
+                else:
+                    cell.font = font(italic=bool(notes and
+                                     notes.startswith("⚠")),
+                                     color="CC0000" if notes and
+                                     notes.startswith("⚠ WORDING") else "000000")
+
+            # Highlight wording warnings in red
+            if notes and "WORDING" in notes:
+                ws.cell(row=row_num, column=5).font = Font(
+                    name="Calibri", size=10, color="CC0000")
+
+            ws.row_dimensions[row_num].height = max(
+                15, min(15 * (text.count("/") + 1), 60))
+            row_num += 1
             continue
 
-        # ── Actuality row — TC cells BLANK, grey background ───────────────
-        row = table.add_row()
-        set_row_widths(row, COL_WIDTHS)
-
-        for cell in row.cells[:4]:   # grey ALL cells including script col
-            set_bg(cell, "E7E6E6")
-            set_borders(cell)
-            cell.vertical_alignment = WD_ALIGN_VERTICAL.TOP
-
-        # TC cells explicitly empty
-        for cell in row.cells[:3]:
-            cell.paragraphs[0].clear()
-
-        sc = row.cells[3]
-        p = sc.paragraphs[0]
-        add_run(p, "Actuality:", italic=True, size=10)
-
+        # ── Actuality row ─────────────────────────────────────────────────
+        row_fill = FILLS["act"]
         if speaker:
-            p2 = sc.add_paragraph()
-            add_run(p2, speaker, bold=True, size=10)
+            script_text = f"[{speaker}]\n{text}"
+        else:
+            script_text = text
 
-        p3 = sc.add_paragraph()
-        for part in text.split(" / "):
-            add_run(p3, part.strip() + " ", italic=True, size=10)
+        for col, val in enumerate(["", "", "", script_text, ""], 1):
+            cell = ws.cell(row=row_num, column=col, value=val)
+            cell.fill      = row_fill
+            cell.border    = border()
+            cell.alignment = align()
+            if col == 4:
+                cell.font = Font(name="Calibri", size=10, italic=True,
+                                 color="444444")
+            else:
+                cell.font = font()
 
-    doc.save(str(output_path))
+        ws.row_dimensions[row_num].height = max(
+            15, min(15 * (text.count("\n") + 1), 80))
+        row_num += 1
+
+    wb.save(str(output_path))
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -907,7 +1187,7 @@ def send_notify_email(user_name, script_name, video_name,
 # Background job runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_path):
+def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_path, edl_path=None):
     job = jobs[job_id]
 
     def log(msg, pct=None):
@@ -922,6 +1202,16 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
         log("Parsing source script…", 5)
         script_lines = parse_source_script(script_path)
         log(f"✓ Found {len(script_lines)} lines in script.", 15)
+
+        # 2 — Parse EDL if provided
+        edl_events = []
+        if edl_path:
+            log("Parsing EDL…", 18)
+            edl_events = parse_edl(edl_path, fps)
+            log(f"✓ {len(edl_events)} EDL events parsed", 22)
+
+        # 3 — Transcribe audio if provided (fallback + wording check)
+        audio_segments = None
 
         # 2 — Audio: extract from video, or use directly if already audio
         AUDIO_EXTS = {".mp3", ".mp4a", ".m4a", ".aac", ".wav", ".flac", ".ogg", ".opus"}
@@ -954,44 +1244,43 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
         size_mb = mp3.stat().st_size / 1024 / 1024
         log(f"✓ Audio ready — {size_mb:.1f} MB", 30)
 
-        # 3 — Transcribe: dual-channel if stereo, mono fallback otherwise
-        stereo = is_stereo(video_path)
-
-        if stereo:
-            log("Stereo file detected — extracting dialogue (L) and VO (R) channels…", 32)
-            extract_channel(video_path, mp3_dial, channel=0)
-            extract_channel(video_path, mp3_vo,   channel=1)
-
-            dial_mb = mp3_dial.stat().st_size / 1024 / 1024
-            vo_mb   = mp3_vo.stat().st_size   / 1024 / 1024
-            log(f"Dialogue channel: {dial_mb:.1f} MB  |  VO channel: {vo_mb:.1f} MB", 34)
-
-            log("Transcribing dialogue channel (Whisper)…", 36)
-            dial_segments = transcribe_openai(mp3_dial, api_key)
-            log(f"✓ Dialogue: {len(dial_segments)} segments", 52)
-
-            log("Transcribing VO channel (Whisper)…", 54)
-            vo_segments = transcribe_openai(mp3_vo, api_key)
-            log(f"✓ VO: {len(vo_segments)} segments", 68)
-
-            segments = {"dial": dial_segments, "vo": vo_segments}
-            log("✓ Dual-channel transcription complete", 70)
+        # 3 — Transcribe audio if we have it
+        if video_path:
+            stereo = is_stereo(video_path)
+            if stereo:
+                log("Stereo detected — extracting L (dialogue) and R (VO) channels…", 32)
+                extract_channel(video_path, mp3_dial, channel=0)
+                extract_channel(video_path, mp3_vo,   channel=1)
+                log(f"Dialogue: {mp3_dial.stat().st_size/1024/1024:.1f} MB  VO: {mp3_vo.stat().st_size/1024/1024:.1f} MB", 36)
+                log("Transcribing dialogue channel…", 38)
+                dial_segs = transcribe_openai(mp3_dial, api_key)
+                log(f"✓ Dialogue: {len(dial_segs)} segments", 52)
+                log("Transcribing VO channel…", 54)
+                vo_segs = transcribe_openai(mp3_vo, api_key)
+                log(f"✓ VO: {len(vo_segs)} segments", 68)
+                audio_segments = {"dial": dial_segs, "vo": vo_segs}
+            else:
+                log("Mono/mixed audio — transcribing…", 36)
+                audio_segments = transcribe_openai(mp3, api_key)
+                log(f"✓ {len(audio_segments)} segments", 68)
         else:
-            log("Mono/mixed file — sending to Whisper API…", 36)
-            segments = transcribe_openai(mp3, api_key)
-            log(f"✓ Transcription complete — {len(segments)} segments", 70)
+            log("No audio file — using EDL only", 68)
 
-        # 4 — Match
+        # 4 — Match: EDL first, audio fallback, wording diff check
         log("Matching timecodes to script…", 75)
-        offset  = tc_to_seconds(tc_offset)
-        matched = match_timecodes(script_lines, segments, offset, fps)
-        n_matched = sum(1 for m in matched if m["tc_in"])
-        log(f"✓ Matched {n_matched} / {len(matched)} lines", 88)
+        offset = tc_to_seconds(tc_offset)
+        matched = match_three_input(
+            script_lines, edl_events, audio_segments, offset, fps,
+            log_fn=lambda m: log(m)
+        )
+        n_matched = sum(1 for m in matched
+                        if m.get("tc_in") and m.get("type") == "vo")
+        log(f"✓ {n_matched} VO lines timecoded", 88)
 
-        # 5 — Build docx
-        log("Building output document…", 92)
-        build_output_docx(matched, output_path, fps)
-        log(f"✓ Done!", 100)
+        # 5 — Build xlsx
+        log("Building output spreadsheet…", 92)
+        build_output_xlsx(matched, output_path, fps)
+        log("✓ Done!", 100)
 
         job["status"]      = "done"
         job["output_path"] = str(output_path)
@@ -1065,11 +1354,17 @@ def index():
 
 @app.route("/api/start", methods=["POST"])
 def start_job():
-    if "script" not in request.files or "video" not in request.files:
-        return jsonify({"error": "Both script and video files are required."}), 400
+    if "script" not in request.files:
+        return jsonify({"error": "Source script file is required."}), 400
+    # Either a video/audio file OR an EDL must be provided
+    has_audio = "video" in request.files and request.files["video"].filename
+    has_edl   = "edl"   in request.files and request.files["edl"].filename
+    if not has_audio and not has_edl:
+        return jsonify({"error": "Please upload either an audio/video file or an EDL file."}), 400
 
     script_file = request.files["script"]
-    video_file  = request.files["video"]
+    video_file  = request.files.get("video")
+    edl_file    = request.files.get("edl")
     user_name   = request.form.get("user_name", "").strip()
     tc_offset   = request.form.get("tc_offset", "10:00:00:00").strip()
     fps         = float(request.form.get("fps", "25"))
@@ -1088,12 +1383,18 @@ def start_job():
 
     job_id      = str(uuid.uuid4())
     script_path = UPLOAD_DIR / f"{job_id}_script.docx"
-    video_path  = UPLOAD_DIR / f"{job_id}_video{Path(video_file.filename).suffix}"
-    output_path = OUTPUT_DIR / f"{job_id}_timecoded.docx"
+    video_path  = UPLOAD_DIR / f"{job_id}_video{Path(video_file.filename).suffix}" if (video_file and video_file.filename) else None
+    output_path = OUTPUT_DIR / f"{job_id}_timecoded.xlsx"
 
     script_file.save(str(script_path))
-    video_file.save(str(video_path))
-    write_usage_log(user_name, script_file.filename, video_file.filename, "started")
+    if video_file and video_file.filename:
+        video_file.save(str(video_path))
+    edl_path = None
+    if edl_file and edl_file.filename:
+        edl_path = str(UPLOAD_DIR / f"{job_id}_edl{Path(edl_file.filename).suffix}")
+        edl_file.save(edl_path)
+    write_usage_log(user_name, script_file.filename,
+                    (video_file.filename if video_file else edl_file.filename if edl_file else ""), "started")
 
     jobs[job_id] = {
         "status":      "running",
@@ -1108,7 +1409,9 @@ def start_job():
 
     thread = threading.Thread(
         target=run_job,
-        args=(job_id, str(script_path), str(video_path), tc_offset, fps, api_key, output_path),
+        args=(job_id, str(script_path),
+              str(video_path) if (video_file and video_file.filename) else None,
+              tc_offset, fps, api_key, output_path, edl_path),
         daemon=True
     )
     thread.start()
@@ -1139,7 +1442,7 @@ def download(job_id):
     path = job["output_path"]
     if not path or not Path(path).exists():
         return jsonify({"error": "Output file missing"}), 500
-    return send_file(path, as_attachment=True, download_name="timecoded_script.docx")
+    return send_file(path, as_attachment=True, download_name="timecoded_script.xlsx")
 
 
 @app.route("/usage")

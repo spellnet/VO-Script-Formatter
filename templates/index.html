@@ -270,9 +270,19 @@
     <div class="drop-zone" id="dzVideo">
       <input type="file" id="videoFile" accept=".mp4,.mov,.mxf,.avi,.mkv,.mp3,.m4a,.aac,.wav,.flac" />
       <div class="dz-icon">🎥</div>
-      <div class="dz-label">Video or Audio File</div>
-      <div class="dz-hint">.mp4 .mov .mxf — or pre-extracted audio: .mp3 .wav .m4a .aac</div>
+      <div class="dz-label">Audio / Video File</div>
+      <div class="dz-hint">Stereo MP3/WAV with dialogue on L, VO on R — or any video file</div>
       <div class="dz-name" id="videoName"></div>
+    </div>
+
+    <div style="text-align:center;color:var(--txt2);font-size:12px;margin:-4px 0 8px">— or —</div>
+
+    <div class="drop-zone" id="dzEdl">
+      <input type="file" id="edlFile" accept=".edl,.txt" />
+      <div class="dz-icon">🎞️</div>
+      <div class="dz-label">EDL from VO Track (CMX 3600)</div>
+      <div class="dz-hint">Export from Avid: Output → Export EDL → CMX 3600, VO track only</div>
+      <div class="dz-name" id="edlName"></div>
     </div>
   </div>
 
@@ -317,8 +327,8 @@
 
       <div class="field">
         <label>Output Filename</label>
-        <input type="text" id="outputName" placeholder="e.g. K9_Heroes_EP1_PP" />
-        <div class="hint">Leave blank to use the script filename. .docx is added automatically.</div>
+        <input type="text" id="outputName" placeholder="e.g. K9_Heroes_EP1_VO_Script" />
+        <div class="hint">Leave blank to use the script filename. .xlsx is added automatically.</div>
       </div>
 
     </div>
@@ -343,7 +353,7 @@
     </div>
     <div id="log"></div>
     <a id="downloadBtn" href="#">
-      ⬇ &nbsp; Download Formatted Script
+      ⬇ &nbsp; Download VO Script (.xlsx)
     </a>
   </div>
 
@@ -389,6 +399,7 @@
 
   setupDropZone("dzScript", "scriptFile", "scriptName");
   setupDropZone("dzVideo",  "videoFile",  "videoName");
+  setupDropZone("dzEdl",    "edlFile",    "edlName");
 
   // Also enable run button when name is entered
   document.getElementById("userName").addEventListener("input", checkReady);
@@ -398,10 +409,12 @@
   function checkReady() {
     const hasScript = !!document.getElementById("scriptFile").files[0];
     const hasVideo  = !!document.getElementById("videoFile").files[0];
+    const hasEdl    = !!document.getElementById("edlFile").files[0];
+    const hasAudio  = hasVideo || hasEdl;
     const hasName   = document.getElementById("userName").value.trim().length > 0;
     const keyEl     = document.getElementById("apiKey");
     const hasKey    = !keyEl || keyEl.value.trim().startsWith("sk-");
-    document.getElementById("runBtn").disabled = !(hasScript && hasVideo && hasName && hasKey);
+    document.getElementById("runBtn").disabled = !(hasScript && hasAudio && hasName && hasKey);
   }
 
   // ── Run ───────────────────────────────────────────────────────────────────
@@ -434,6 +447,8 @@
     form.append("tc_offset", tcOffset);
     form.append("fps",       fps);
     if (apiKey) form.append("api_key", apiKey);
+    const edlFileEl = document.getElementById("edlFile").files[0];
+    if (edlFileEl) form.append("edl", edlFileEl);
 
     let resp;
     try {
@@ -474,7 +489,7 @@
         clearInterval(pollInterval);
         const dlBtn   = document.getElementById("downloadBtn");
         const rawName = document.getElementById("outputName").value.trim();
-        const fname   = (rawName || "timecoded_script").replace(/\.docx$/i, "") + ".docx";
+        const fname   = (rawName || "timecoded_script").replace(/\.(docx|xlsx)$/i, "") + ".xlsx";
         dlBtn.href     = `/api/download/${currentJobId}`;
         dlBtn.setAttribute("download", fname);
         dlBtn.classList.add("visible");
