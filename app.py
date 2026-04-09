@@ -167,6 +167,8 @@ def parse_source_script(docx_path):
                 results.append({"type": "act", "speaker": None, "text": text})
 
             i += 1
+        for r in results:
+            r.setdefault("notes", "")
         return results
 
     # ── Walk tables ───────────────────────────────────────────────────────────
@@ -865,7 +867,7 @@ def match_three_input(script_lines, edl_events, audio_segments,
             "tc_in":  tc_in,
             "tc_out": tc_out,
             "dur":    dur,
-            "notes":  note,
+            "_match_note": note,
             "_t_in":  t_in_raw,
         })
 
@@ -899,7 +901,7 @@ def match_three_input(script_lines, edl_events, audio_segments,
         results[idx]["tc_out"] = "~" + seconds_to_tc(est_out, tc_offset_secs, fps)
         results[idx]["dur"]    = dur_str(est_out - est_in)
         if not results[idx]["notes"]:
-            results[idx]["notes"] = "⚠ TC estimated — check against cut"
+            results[idx]["_match_note"] = "⚠ TC estimated — check against cut"
         results[idx]["_t_in"] = est_in
 
     # Summary
@@ -992,8 +994,10 @@ def build_output_xlsx(matched_lines, output_path, fps):
         tc_in   = line.get("tc_in",   "")
         tc_out  = line.get("tc_out",  "")
         dur     = line.get("dur",     "")
-        speaker = line.get("speaker", "")
-        notes   = line.get("notes",   "")
+        speaker    = line.get("speaker", "")
+        src_note   = line.get("notes", "")
+        match_note = line.get("_match_note", "")
+        notes      = " | ".join(filter(None, [src_note, match_note]))
 
         # ── Section / story header ─────────────────────────────────────────
         if ltype == "section":
