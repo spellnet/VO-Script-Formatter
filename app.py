@@ -414,7 +414,12 @@ def match_from_edl(script_lines, edl_events, fps):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def transcribe_openai(audio_path, api_key):
-    """Call OpenAI Whisper API. Returns list of {start, end, text} segments."""
+    """
+    Call OpenAI Whisper API with word-level timestamps.
+    Returns list of {start, end, text} — one entry per segment,
+    but start/end are taken from the first/last WORD in the segment
+    for frame-accurate timing rather than segment-level estimates.
+    """
     from openai import OpenAI
 
     client  = OpenAI(api_key=api_key)
@@ -422,25 +427,51 @@ def transcribe_openai(audio_path, api_key):
 
     if size_mb > 24:
         raise RuntimeError(
-            f"Audio file is {size_mb:.1f} MB — exceeds OpenAI's 25 MB limit. "
+            f"Audio file is {size_mb:.1f} MB — exceeds OpenAI 25 MB limit. "
             "Try a shorter programme or lower-bitrate export."
         )
 
     with open(audio_path, "rb") as f:
         response = client.audio.transcriptions.create(
-            model        = "whisper-1",
-            file         = f,
-            response_format = "verbose_json",
-            timestamp_granularities = ["segment"]
+            model                   = "whisper-1",
+            file                    = f,
+            response_format         = "verbose_json",
+            timestamp_granularities = ["segment", "word"]
         )
 
+    # Build word index: list of {start, end, word}
+    words = []
+    if hasattr(response, "words") and response.words:
+        for w in response.words:
+            words.append({
+                "start": float(w.start),
+                "end":   float(w.end),
+                "word":  w.word.strip(),
+            })
+
+    # Map each segment to word-accurate start/end
     segments = []
+    word_idx = 0
     for seg in response.segments:
+        seg_start = float(seg.start)
+        seg_end   = float(seg.end)
+        seg_text  = seg.text.strip()
+
+        if words:
+            # Find words that fall within this segment
+            seg_words = [w for w in words
+                         if w["start"] >= seg_start - 0.1
+                         and w["end"]   <= seg_end   + 0.1]
+            if seg_words:
+                seg_start = seg_words[0]["start"]
+                seg_end   = seg_words[-1]["end"]
+
         segments.append({
-            "start": float(seg.start),
-            "end":   float(seg.end),
-            "text":  seg.text.strip()
+            "start": seg_start,
+            "end":   seg_end,
+            "text":  seg_text,
         })
+
     return segments
 
 
@@ -737,44 +768,70 @@ def match_three_input(script_lines, edl_events, audio_segments,
     """
     Three-input matching for VO lines:
 
-    1. EDL (primary)  — assign EDL events to VO lines by sequence order.
-                        Frame-accurate, no wording comparison needed.
-    2. Audio fallback — for VO lines with no EDL event, try Whisper transcript.
-                        Also used to verify wording of EDL-matched lines.
-    3. Wording check  — if Whisper heard something >15% different from the
-                        script, add a note flagging the discrepancy.
+    1. Find VO line position via Whisper audio matching (word-accurate TC)
+    2. If an EDL event exists within 2 seconds of the Whisper position,
+       use the EDL TC (frame-accurate). Otherwise use Whisper TC (~flagged).
+    3. Wording check: if Whisper text differs >15% from script, flag in Notes.
+    4. Cursor hard-stops when audio segments are exhausted — no false matches.
 
     Actuality lines always get blank TCs.
-    Interpolation fills remaining blanks between confirmed anchors.
     """
-    WORDING_THRESHOLD = 0.15   # flag if similarity < (1 - 0.15) = 0.85
+    WORDING_THRESHOLD = 0.15
+    EDL_VERIFY_WINDOW = 2.0    # seconds — match EDL event if within this range
+    LOOKAHEAD         = 120
+    WINDOW            = 12
+    THRESHOLD         = 0.20
+    FALLBACK          = 0.08
 
-    results  = []
-    edl_idx  = 0
+    results = []
 
-    # ── Flatten audio segments for fallback matching ──────────────────────────
+    # ── Flatten audio segments ─────────────────────────────────────────────
     if isinstance(audio_segments, dict):
-        # Stereo: use VO channel for VO, dial channel for actuality
         vo_segs   = audio_segments.get("vo",   [])
         dial_segs = audio_segments.get("dial", [])
     elif audio_segments:
-        # Mono: use same pool for both
         vo_segs   = audio_segments
         dial_segs = audio_segments
     else:
         vo_segs   = []
         dial_segs = []
 
-    vo_cursor   = 0
-    WINDOW      = 12
-    LOOKAHEAD   = 120
-    THRESHOLD   = 0.20
-    n_segs_vo   = len(vo_segs)
-    total_audio = (vo_segs[-1]["end"] if vo_segs
-                   else dial_segs[-1]["end"] if dial_segs else 0.0)
+    n_vo      = len(vo_segs)
+    total_dur = vo_segs[-1]["end"] if vo_segs else (
+                dial_segs[-1]["end"] if dial_segs else 0.0)
+
+    # ── Build EDL lookup: sorted list of (rec_in_seconds, event) ─────────
+    def tc_s(tc, fps=fps):
+        p = tc.replace(";",":").split(":")
+        return int(p[0])*3600 + int(p[1])*60 + int(p[2]) + int(p[3])/fps
+
+    edl_by_time = []
+    for ev in edl_events:
+        try:
+            edl_by_time.append((tc_s(ev["rec_in"]), ev))
+        except:
+            pass
+    edl_by_time.sort(key=lambda x: x[0])
+    edl_used = set()   # track which EDL events have been assigned
+
+    def find_edl_near(whisper_t_in, whisper_t_out):
+        """Find an unused EDL event whose rec_in is within EDL_VERIFY_WINDOW
+        of the Whisper TC In. Returns event or None."""
+        best = None
+        best_diff = EDL_VERIFY_WINDOW + 1
+        for t, ev in edl_by_time:
+            if id(ev) in edl_used:
+                continue
+            diff = abs(t - whisper_t_in)
+            if diff <= EDL_VERIFY_WINDOW and diff < best_diff:
+                best_diff = diff
+                best = ev
+        return best
 
     def best_audio_match(norm_text, seg_list, cursor):
         n = len(seg_list)
+        if cursor >= n:
+            return 0.0, None, None
         best_score = 0.0
         best_i = best_j = None
         end = min(cursor + LOOKAHEAD, n)
@@ -792,91 +849,123 @@ def match_three_input(script_lines, edl_events, audio_segments,
         return best_score, best_i, best_j
 
     def audio_text_for(bi, bj, seg_list):
-        """Reconstruct what Whisper heard for a matched span."""
         return " ".join(seg_list[k]["text"].strip()
                         for k in range(bi, bj + 1)).strip()
 
-    # ── Main pass ─────────────────────────────────────────────────────────────
+    vo_cursor = 0
+
+    # ── Main pass ─────────────────────────────────────────────────────────
     for line in script_lines:
         ltype  = line.get("type", "act")
         text   = line.get("text", "").strip()
 
-        # Headers / coda — no TC
         if ltype in ("section", "part", "coda") or not text:
             results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
-                            "notes": "", "_t_in": None})
+                            "_match_note": "", "_t_in": None})
             continue
 
-        # Actuality — no TC, reference only
+        # Actuality — blank TC
         if ltype != "vo":
             results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
-                            "notes": "", "_t_in": None})
+                            "_match_note": "", "_t_in": None})
             continue
 
-        # ── VO line: try EDL first ────────────────────────────────────────
-        note = ""
+        # ── VO line ───────────────────────────────────────────────────────
         tc_in = tc_out = dur = ""
+        note  = ""
         t_in_raw = None
 
-        if edl_idx < len(edl_events):
-            ev     = edl_events[edl_idx]
-            tc_in  = ev["rec_in"]
-            tc_out = ev["rec_out"]
-            def tc_s(tc):
-                p = tc.replace(";",":").split(":")
-                return int(p[0])*3600+int(p[1])*60+int(p[2])+int(p[3])/fps
-            dur_secs  = max(tc_s(tc_out) - tc_s(tc_in), 0)
-            dur       = dur_str(dur_secs)
-            t_in_raw  = tc_s(tc_in)
-            edl_idx  += 1
+        norm_script = normalize(text)
 
-            # Wording check against audio if available
-            if vo_segs:
-                norm_script = normalize(text)
-                score, bi, bj = best_audio_match(
-                    norm_script, vo_segs, vo_cursor)
-                if score >= 0.20 and bi is not None:
-                    vo_cursor = bj + 1
-                    heard = audio_text_for(bi, bj, vo_segs)
-                    sim   = similarity(norm_script, normalize(heard))
-                    if sim < (1 - WORDING_THRESHOLD):
-                        script_snippet = text[:60] + ("..." if len(text) > 60 else "")
-                        heard_snippet  = heard[:60] + ("..." if len(heard) > 60 else "")
-                        note = f"WORDING: script: {script_snippet!r} | audio: {heard_snippet!r}"
+        # Step 1: find position in Whisper audio
+        whisper_t_in = whisper_t_out = None
+        whisper_heard = ""
 
-        elif vo_segs:
-            # No EDL event — fall back to audio
-            norm_script = normalize(text)
-            score, bi, bj = best_audio_match(
-                norm_script, vo_segs, vo_cursor)
+        if vo_segs and vo_cursor < n_vo:
+            score, bi, bj = best_audio_match(norm_script, vo_segs, vo_cursor)
+
             if score >= THRESHOLD and bi is not None:
-                vo_cursor = bj + 1
-                t_in_raw  = vo_segs[bi]["start"]
-                t_out_raw = vo_segs[bj]["end"]
-                tc_in     = "~" + seconds_to_tc(t_in_raw, tc_offset_secs, fps)
-                tc_out    = "~" + seconds_to_tc(t_out_raw, tc_offset_secs, fps)
-                dur       = dur_str(t_out_raw - t_in_raw)
-                note      = "TC from audio (no EDL event)"
+                vo_cursor     = bj + 1
+                whisper_t_in  = vo_segs[bi]["start"]
+                whisper_t_out = vo_segs[bj]["end"]
+                whisper_heard = audio_text_for(bi, bj, vo_segs)
+            elif score >= FALLBACK and bi is not None:
+                vo_cursor     = bj + 1
+                whisper_t_in  = vo_segs[bi]["start"]
+                whisper_t_out = vo_segs[bj]["end"]
+                whisper_heard = audio_text_for(bi, bj, vo_segs)
+                note = "⚠ low-confidence Whisper match"
+
+        # Step 2: verify / replace with EDL if within window
+        if whisper_t_in is not None and edl_by_time:
+            edl_ev = find_edl_near(whisper_t_in, whisper_t_out)
+            if edl_ev:
+                edl_used.add(id(edl_ev))
+                tc_in    = edl_ev["rec_in"]
+                tc_out   = edl_ev["rec_out"]
+                dur_secs = max(tc_s(tc_out) - tc_s(tc_in), 0)
+                dur      = dur_str(dur_secs)
+                t_in_raw = tc_s(tc_in)
+                # Clear low-confidence note if EDL confirmed position
+                if note == "⚠ low-confidence Whisper match":
+                    note = ""
             else:
-                note = "NOT FOUND IN EDL OR AUDIO"
+                # No EDL near this position — use Whisper TC
+                tc_in    = "~" + seconds_to_tc(whisper_t_in,  tc_offset_secs, fps)
+                tc_out   = "~" + seconds_to_tc(whisper_t_out, tc_offset_secs, fps)
+                dur      = dur_str(whisper_t_out - whisper_t_in)
+                t_in_raw = whisper_t_in
+                if not note:
+                    note = "TC from audio only (no matching EDL event)"
+
+        elif whisper_t_in is not None:
+            # No EDL at all — pure Whisper
+            tc_in    = "~" + seconds_to_tc(whisper_t_in,  tc_offset_secs, fps)
+            tc_out   = "~" + seconds_to_tc(whisper_t_out, tc_offset_secs, fps)
+            dur      = dur_str(whisper_t_out - whisper_t_in)
+            t_in_raw = whisper_t_in
+
+        elif edl_by_time:
+            # No audio — try sequential EDL assignment
+            for t, ev in edl_by_time:
+                if id(ev) not in edl_used:
+                    edl_used.add(id(ev))
+                    tc_in    = ev["rec_in"]
+                    tc_out   = ev["rec_out"]
+                    dur_secs = max(tc_s(tc_out) - tc_s(tc_in), 0)
+                    dur      = dur_str(dur_secs)
+                    t_in_raw = tc_s(tc_in)
+                    break
+            else:
+                note = "NOT FOUND — no EDL event or audio match"
+
         else:
-            note = "NOT FOUND — no EDL event and no audio provided"
+            note = "NOT FOUND — no EDL or audio provided"
+
+        # Step 3: wording check
+        if whisper_heard and not note.startswith("NOT FOUND"):
+            sim = similarity(norm_script, normalize(whisper_heard))
+            if sim < (1 - WORDING_THRESHOLD):
+                script_snip = text[:60] + ("..." if len(text) > 60 else "")
+                heard_snip  = whisper_heard[:60] + ("..." if len(whisper_heard) > 60 else "")
+                wording_note = f"WORDING: script: {script_snip!r} | audio: {heard_snip!r}"
+                note = (note + " | " + wording_note).strip(" | ")
 
         results.append({
             **line,
-            "tc_in":  tc_in,
-            "tc_out": tc_out,
-            "dur":    dur,
-            "_match_note": note,
-            "_t_in":  t_in_raw,
+            "tc_in":        tc_in,
+            "tc_out":       tc_out,
+            "dur":          dur,
+            "_match_note":  note,
+            "_t_in":        t_in_raw,
         })
 
-    # ── Interpolation pass for remaining blanks ───────────────────────────────
+    # ── Interpolation for remaining blanks ────────────────────────────────
     anchors = [(-1, 0.0)]
     for i, r in enumerate(results):
         if r.get("_t_in") is not None:
             anchors.append((i, r["_t_in"]))
-    anchors.append((len(results), total_audio))
+    anchors.append((len(results), total_dur))
 
     for idx, r in enumerate(results):
         if r.get("_t_in") is not None:
@@ -885,38 +974,37 @@ def match_three_input(script_lines, edl_events, audio_segments,
             continue
         if r.get("type") != "vo":
             continue
-        if "NOT FOUND" in r.get("notes",""):
-            continue   # leave as-is, already flagged
+        if "NOT FOUND" in r.get("_match_note",""):
+            continue
 
         prev_a = anchors[0]; next_a = anchors[-1]
         for a in anchors:
             if a[0] < idx:   prev_a = a
             elif a[0] > idx: next_a = a; break
+
         prev_i, prev_t = prev_a
         next_i, next_t = next_a
         frac    = (idx - prev_i) / max(next_i - prev_i, 1)
         est_in  = prev_t + frac * (next_t - prev_t)
         est_out = min(est_in + 4.0, next_t)
-        results[idx]["tc_in"]  = "~" + seconds_to_tc(est_in,  tc_offset_secs, fps)
-        results[idx]["tc_out"] = "~" + seconds_to_tc(est_out, tc_offset_secs, fps)
-        results[idx]["dur"]    = dur_str(est_out - est_in)
-        if not results[idx]["notes"]:
-            results[idx]["_match_note"] = "⚠ TC estimated — check against cut"
-        results[idx]["_t_in"] = est_in
+        results[idx]["tc_in"]       = "~" + seconds_to_tc(est_in,  tc_offset_secs, fps)
+        results[idx]["tc_out"]      = "~" + seconds_to_tc(est_out, tc_offset_secs, fps)
+        results[idx]["dur"]         = dur_str(est_out - est_in)
+        results[idx]["_match_note"] = "⚠ TC estimated — check against cut"
+        results[idx]["_t_in"]       = est_in
 
     # Summary
     n_edl    = sum(1 for r in results if r.get("type")=="vo"
                    and r.get("tc_in") and not r["tc_in"].startswith("~")
-                   and "NOT FOUND" not in r.get("notes",""))
+                   and "NOT FOUND" not in r.get("_match_note",""))
     n_audio  = sum(1 for r in results if r.get("type")=="vo"
                    and r.get("tc_in","").startswith("~")
-                   and "audio" in r.get("notes",""))
-    n_interp = sum(1 for r in results if r.get("type")=="vo"
-                   and "estimated" in r.get("notes",""))
-    n_warn   = sum(1 for r in results if "WORDING" in r.get("notes",""))
-    n_miss   = sum(1 for r in results if "NOT FOUND" in r.get("notes",""))
-    log_fn(f"Match: {n_edl} EDL | {n_audio} audio | {n_interp} estimated "
-           f"| {n_warn} wording ⚠ | {n_miss} missing")
+                   and "audio only" in r.get("_match_note",""))
+    n_interp = sum(1 for r in results if "estimated" in r.get("_match_note",""))
+    n_warn   = sum(1 for r in results if "WORDING" in r.get("_match_note",""))
+    n_miss   = sum(1 for r in results if "NOT FOUND" in r.get("_match_note",""))
+    log_fn(f"Match: {n_edl} EDL-verified | {n_audio} audio-only | "
+           f"{n_interp} estimated | {n_warn} wording ⚠ | {n_miss} missing")
 
     for r in results:
         r.pop("_t_in", None)
@@ -999,40 +1087,21 @@ def build_output_xlsx(matched_lines, output_path, fps):
         match_note = line.get("_match_note", "")
         notes      = " | ".join(filter(None, [src_note, match_note]))
 
-        # ── Section / story header ─────────────────────────────────────────
-        if ltype == "section":
-            ws.merge_cells(f"A{row_num}:E{row_num}")
-            cell = ws.cell(row=row_num, column=1, value=text.upper())
-            cell.font      = Font(name="Calibri", size=10, bold=True,
-                                  color="000000")
-            cell.fill      = FILLS["section"]
-            cell.border    = border()
-            cell.alignment = align(horizontal="left")
+        # ── Section / part / coda header rows — no merged cells, all blue ──
+        if ltype in ("section", "part", "coda"):
+            label_text = text.upper() if ltype == "section" else text
+            is_coda    = ltype == "coda"
+            for col in range(1, 6):
+                cell = ws.cell(row=row_num, column=col,
+                               value=label_text if col == 4 else "")
+                cell.fill      = FILLS["section"]   # all blue
+                cell.border    = border()
+                cell.alignment = align(horizontal="left")
+                cell.font      = Font(name="Calibri", size=10,
+                                      bold=not is_coda,
+                                      italic=is_coda,
+                                      color="000000")
             ws.row_dimensions[row_num].height = 16
-            row_num += 1
-            continue
-
-        # ── Part / act break ──────────────────────────────────────────────
-        if ltype == "part":
-            ws.merge_cells(f"A{row_num}:E{row_num}")
-            cell = ws.cell(row=row_num, column=1, value=text)
-            cell.font      = Font(name="Calibri", size=10, bold=True,
-                                  color="000000")
-            cell.fill      = FILLS["part"]
-            cell.border    = border()
-            cell.alignment = align(horizontal="left")
-            ws.row_dimensions[row_num].height = 16
-            row_num += 1
-            continue
-
-        # ── Coda ──────────────────────────────────────────────────────────
-        if ltype == "coda":
-            ws.merge_cells(f"A{row_num}:E{row_num}")
-            cell = ws.cell(row=row_num, column=1, value=text)
-            cell.font      = font(italic=True, color="555555")
-            cell.fill      = FILLS["coda"]
-            cell.border    = border()
-            cell.alignment = align()
             row_num += 1
             continue
 
@@ -1045,7 +1114,7 @@ def build_output_xlsx(matched_lines, output_path, fps):
             if tc_in.startswith("~") and not notes:
                 notes = "⚠ TC estimated — check against cut"
 
-            script_text = "VO:\n" + text.replace(" / ", "\n")
+            script_text = "VO: " + text.replace(" / ", "\n")
 
             values = [display_in, display_out, dur, script_text, notes]
             for col, val in enumerate(values, 1):
@@ -1076,9 +1145,9 @@ def build_output_xlsx(matched_lines, output_path, fps):
         # ── Actuality row ─────────────────────────────────────────────────
         row_fill = FILLS["act"]
         if speaker:
-            script_text = f"[{speaker}]\n{text}"
+            script_text = f"Actuality: {speaker}: {text}"
         else:
-            script_text = text
+            script_text = f"Actuality: {text}"
 
         for col, val in enumerate(["", "", "", script_text, ""], 1):
             cell = ws.cell(row=row_num, column=col, value=val)
