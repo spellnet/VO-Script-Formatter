@@ -74,15 +74,17 @@ def dur_str(secs):
 def parse_source_script(docx_path):
     """
     Parse a two-column Stampede source script:
+      Col 0 (left)  — scene name OR editorial note
+      Col 1 (right) — VO (bold uppercase) or Actuality (italic / SPEAKER:)
 
-      Col 0 (left)  — scene/segment name, e.g. "BRIMMING WITH BUNDLES"
-                      Only populated on the first row of each scene.
-      Col 1 (right) — script content:
-                        Bold UPPERCASE → VO
-                        Italic / SPEAKER: dialogue → Actuality
-
-    Returns list of dicts: {type, speaker, text}
-    type = 'section' | 'vo' | 'act'
+    Rules:
+    - First table row = document title block → SKIP entirely
+    - Col 0 bold/uppercase/short → section header row (no TC, blue)
+    - Col 0 other text → editorial note, attach to Notes of next content row
+    - Col 1 bold uppercase → VO line
+    - Col 1 italic or SPEAKER: → Actuality line
+    - Section/part labels that appear IN col 1 (e.g. "COMM", "PART TWO")
+      → section header row, NOT a VO line with a TC
     """
     from docx import Document
 
@@ -91,18 +93,16 @@ def parse_source_script(docx_path):
         raise RuntimeError(f"File not found: {docx_path}")
     if p.stat().st_size < 4096:
         raise RuntimeError(
-            f"File appears to be a OneDrive cloud placeholder ({p.stat().st_size} bytes). "
+            f"File appears to be a OneDrive placeholder ({p.stat().st_size} bytes). "
             "Right-click → 'Always keep on this device', then retry."
         )
-
     import tempfile, shutil
     tmp = Path(tempfile.mkdtemp()) / "source.docx"
     shutil.copy2(str(p), str(tmp))
-
     try:
         doc = Document(str(tmp))
     except Exception as e:
-        raise RuntimeError(f"Cannot open script file (is it open in Word?): {e}")
+        raise RuntimeError(f"Cannot open script (is it open in Word?): {e}")
 
     lines = []
 
@@ -112,11 +112,29 @@ def parse_source_script(docx_path):
     def is_italic(para):
         return any(r.italic for r in para.runs if r.text.strip())
 
-    def classify_content_cell(cell):
-        """Parse the right-hand content cell of a script row."""
+    # Words that mark a label row rather than VO content
+    LABEL_KEYWORDS = {
+        "PART ONE","PART TWO","PART THREE","PART FOUR","PART FIVE",
+        "PART SIX","PART BREAK","ACT 1","ACT 2","ACT 3","ACT 4","ACT 5",
+        "ACT 6","TITLES","COLD OPEN","TEASER","TAG","END OF SHOW",
+        "WEIGHT LOSS","CODA","COMM","RECAP",
+    }
+
+    def is_label(text):
+        t = text.upper().strip()
+        if any(kw in t for kw in LABEL_KEYWORDS):
+            return True
+        # Short bold all-caps (≤6 words) with no lowercase = label
+        if t == t.upper() and len(text.split()) <= 6 and len(text) > 2:
+            return True
+        return False
+
+    def classify_content_cell(cell, pending_note=""):
+        """Parse right-hand content cell. Returns list of line dicts."""
         results = []
         paras   = cell.paragraphs
         i       = 0
+        first   = True
         while i < len(paras):
             para = paras[i]
             text = para.text.strip()
@@ -126,21 +144,37 @@ def parse_source_script(docx_path):
             bold   = is_bold(para)
             italic = is_italic(para)
 
-            # VO: bold AND uppercase
+            # Label keywords in content cell → section header, no TC
+            if is_label(text) and bold:
+                results.append({
+                    "type":    "section",
+                    "speaker": None,
+                    "text":    text,
+                    "notes":   "",
+                })
+                i += 1; first = False; continue
+
+            # VO: bold AND uppercase (and not a label)
             if bold and text == text.upper() and len(text) > 2:
                 block = [text]
                 while i + 1 < len(paras):
                     nxt = paras[i + 1]
                     nt  = nxt.text.strip()
-                    if nt and is_bold(nxt) and nt == nt.upper():
+                    if nt and is_bold(nxt) and nt == nt.upper() and not is_label(nt):
                         block.append(nt); i += 1
                     else:
                         break
-                results.append({"type": "vo", "speaker": None,
-                                 "text": " / ".join(block)})
+                note = pending_note if first else ""
+                results.append({
+                    "type":    "vo",
+                    "speaker": None,
+                    "text":    " / ".join(block),
+                    "notes":   note,
+                })
+                first = False
 
-            # Actuality: italic or SPEAKER: dialogue pattern
-            elif italic or re.match(r'^[A-Z][A-Z0-9\s\.\-]+:\s', text):
+            # Actuality: italic or SPEAKER: pattern
+            elif italic or re.match(r'^[A-Z][A-Z0-9 .\-]+: ', text):
                 m = re.match(r'^([A-Z][A-Z0-9\s\.\-]+):\s*(.*)', text)
                 if m:
                     speaker = m.group(1).strip()
@@ -150,74 +184,141 @@ def parse_source_script(docx_path):
                         nxt = paras[i + 1]
                         nt  = nxt.text.strip()
                         if (not nt
-                                or re.match(r'^[A-Z][A-Z0-9\s\.\-]+:\s', nt)
+                                or re.match(r'^[A-Z][A-Z0-9 .\-]+: ', nt)
                                 or (is_bold(nxt) and nt == nt.upper())):
                             break
                         block.append(nt); i += 1
-                    results.append({"type": "act", "speaker": speaker,
-                                    "text": " ".join(block)})
+                    results.append({
+                        "type":    "act",
+                        "speaker": speaker,
+                        "text":    " ".join(block),
+                        "notes":   "",
+                    })
                 else:
-                    results.append({"type": "act", "speaker": None, "text": text})
+                    results.append({
+                        "type":    "act",
+                        "speaker": None,
+                        "text":    text,
+                        "notes":   "",
+                    })
+                first = False
 
-            # Bold mixed-case or short bold → treat as VO/label
             elif bold:
-                results.append({"type": "vo", "speaker": None, "text": text})
-
+                note = pending_note if first else ""
+                results.append({
+                    "type":    "vo",
+                    "speaker": None,
+                    "text":    text,
+                    "notes":   note,
+                })
+                first = False
             else:
-                results.append({"type": "act", "speaker": None, "text": text})
+                results.append({
+                    "type":    "act",
+                    "speaker": None,
+                    "text":    text,
+                    "notes":   "",
+                })
+                first = False
 
             i += 1
+
         for r in results:
             r.setdefault("notes", "")
         return results
 
-    # ── Walk tables ───────────────────────────────────────────────────────────
-    # Find the script table: the one whose rows have 2 columns and whose
-    # first column occasionally contains scene names.
-    # Prefer the largest table if multiple exist.
+    # ── Find script table ─────────────────────────────────────────────────────
     script_table = None
     for table in doc.tables:
         if not table.rows:
             continue
-        # Skip header tables (contain "Time Code" etc.)
         first_row_text = " ".join(
             c.text.strip().lower() for c in table.rows[0].cells
         )
         TC_KEYWORDS = {"time code", "timecode", "tc in", "tc out"}
         if any(kw in first_row_text for kw in TC_KEYWORDS):
             continue
-        # Pick the table with the most rows
         if script_table is None or len(table.rows) > len(script_table.rows):
             script_table = table
 
     if script_table is None:
-        raise RuntimeError(
-            "Could not find a script table in the document. "
-            "Please check the source file format."
-        )
+        raise RuntimeError("Could not find a script table in the document.")
 
+    # ── Walk rows ─────────────────────────────────────────────────────────────
     current_section = None
+    pending_note    = ""
+    first_row       = True
 
     for row in script_table.rows:
         cells = row.cells
         if len(cells) < 2:
             continue
 
-        left  = cells[0].text.strip()
+        left  = cells[0].text.strip().strip("*").strip()
         right = cells[1].text.strip()
 
-        # Left column: scene/segment name — emit as section header
-        if left:
-            # Clean up bold markers and normalise
-            scene = left.strip("*").strip()
-            if scene and scene != current_section:
-                current_section = scene
-                lines.append({"type": "section", "speaker": None,
-                               "text": scene})
+        # Skip the document title block (first non-empty right-col row
+        # that contains version/title info like "COMPILATION:" or "SCRIPT")
+        if first_row and right:
+            right_upper = right.upper()
+            if any(kw in right_upper for kw in [
+                "COMPILATION:", "PRODUCTION NUMBER", "PRODUCTION TITLE",
+                "SERIES / EPISODE", "VO SCRIPT", "VERSION", "DATE:",
+                "DISCOVERY VIEWING", "NAT GEO", "DISCOVERY CHANNEL"
+            ]):
+                first_row = False
+                continue
+            # Also skip if right col is short bold text with no actuality/VO structure
+            first_row = False
 
-        # Right column: VO and actuality content
+        # Left column
+        if left:
+            cell0    = cells[0]
+            is_bold0 = any(r.bold for r in cell0.paragraphs[0].runs
+                           if r.text.strip()) if cell0.paragraphs else False
+            is_upper = left == left.upper() and len(left) > 2
+            is_short = len(left.split()) <= 8
+
+            # Detect if this looks like a section name vs editorial note
+            if (is_bold0 or is_upper) and is_short and is_label(left):
+                # Section header
+                if left != current_section:
+                    current_section = left
+                    lines.append({
+                        "type":    "section",
+                        "speaker": None,
+                        "text":    left,
+                        "notes":   "",
+                    })
+                pending_note = ""
+            elif (is_bold0 or is_upper) and is_short and left != current_section:
+                # Treat as scene name section header
+                current_section = left
+                lines.append({
+                    "type":    "section",
+                    "speaker": None,
+                    "text":    left,
+                    "notes":   "",
+                })
+                pending_note = ""
+            else:
+                # Editorial note — skip if it looks like production metadata
+                skip_patterns = [
+                    "SG:", "SG :", "PLEASE ", "CAN WE ", "NOTE:",
+                    "TODO", "CHECK", "FRAME OF", "FLASH FRAME",
+                    "21:11", "27:42", "14:13", "36:14",  # timecode notes
+                ]
+                if any(sp in left.upper() for sp in skip_patterns):
+                    pass  # skip production notes
+                else:
+                    pending_note = left if not pending_note else pending_note + " | " + left
+
+        # Right column
         if right:
-            lines.extend(classify_content_cell(cells[1]))
+            new_lines = classify_content_cell(cells[1], pending_note)
+            if new_lines:
+                pending_note = ""
+            lines.extend(new_lines)
 
     return lines
 
@@ -1113,6 +1214,14 @@ def build_output_xlsx(matched_lines, output_path, fps):
             display_out = tc_out.lstrip("~")
             if tc_in.startswith("~") and not notes:
                 notes = "⚠ TC estimated — check against cut"
+            # Sanity check: if duration < 1 second, something went wrong
+            try:
+                def _s(tc):
+                    p=tc.lstrip("~").replace(";",":").split(":")
+                    return int(p[0])*3600+int(p[1])*60+int(p[2])+int(p[3])/25
+                if dur and (_s(display_out)-_s(display_in)) < 1.0:
+                    if not notes: notes = "⚠ Duration <1s — check TC"
+            except: pass
 
             script_text = "VO: " + text.replace(" / ", "\n")
 
