@@ -171,19 +171,21 @@ def parse_source_script(docx_path):
                 while i + 1 < len(paras):
                     nxt = paras[i + 1]
                     nt  = nxt.text.strip()
-                    nxt_bold = is_bold(nxt)
                     nxt_italic = is_italic(nxt)
                     if nt and nt == nt.upper() and not is_label(nt) and not nxt_italic:
                         block.append(nt); i += 1
                     else:
                         break
-                note = pending_note if first else ""
-                results.append({
-                    "type":    "vo",
-                    "speaker": None,
-                    "text":    " / ".join(block),
-                    "notes":   note,
-                })
+                # Emit each VO paragraph as a SEPARATE line
+                # so each one gets its own EDL event / TC
+                for bi, vo_text in enumerate(block):
+                    note = pending_note if (first and bi == 0) else ""
+                    results.append({
+                        "type":    "vo",
+                        "speaker": None,
+                        "text":    vo_text,
+                        "notes":   note,
+                    })
                 first = False
 
             # Actuality: italic or SPEAKER: pattern
