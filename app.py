@@ -1088,61 +1088,65 @@ def build_output_xlsx(matched_lines, output_path, fps):
     ws.freeze_panes = "A2"
 
     # ── Data rows ─────────────────────────────────────────────────────────────
-    row_num = 2
-    import re as _re
+    row_num   = 2
+    prev_type = None   # for actuality grouping
 
     for line in matched_lines:
-        ltype   = line.get("type",    "act")
-        text    = line.get("text",    "")
-        tc_in   = line.get("tc_in",   "")
-        tc_out  = line.get("tc_out",  "")
-        dur     = line.get("dur",     "")
-        speaker    = line.get("speaker", "")
-        src_note   = line.get("notes", "")
+        ltype      = line.get("type",        "act")
+        text       = line.get("text",        "").strip()
+        tc_in      = line.get("tc_in",       "")
+        tc_out     = line.get("tc_out",      "")
+        dur        = line.get("dur",         "")
+        speaker    = line.get("speaker",     "")
         match_note = line.get("_match_note", "")
-        notes      = " | ".join(filter(None, [src_note, match_note]))
+        notes      = match_note   # col 1 source notes are suppressed
 
-        # ── Section / part / coda header rows — no merged cells, all blue ──
+        # ── Skip COMM rows and bare "VO" rows ─────────────────────────────
+        if text.upper() == "COMM":
+            continue
+        if ltype == "vo" and text.upper() in ("", "VO"):
+            continue
+        if not text:
+            continue
+
+        # ── Section / part / coda — blue header, no merged cells ──────────
         if ltype in ("section", "part", "coda"):
             label_text = text.upper() if ltype == "section" else text
-            is_coda    = ltype == "coda"
             for col in range(1, 6):
                 cell = ws.cell(row=row_num, column=col,
                                value=label_text if col == 4 else "")
-                cell.fill      = FILLS["section"]   # all blue
+                cell.fill      = FILLS["section"]
                 cell.border    = border()
                 cell.alignment = align(horizontal="left")
                 cell.font      = Font(name="Calibri", size=10,
-                                      bold=not is_coda,
-                                      italic=is_coda,
+                                      bold=(ltype != "coda"),
+                                      italic=(ltype == "coda"),
                                       color="000000")
             ws.row_dimensions[row_num].height = 16
+            prev_type = ltype
             row_num += 1
             continue
 
         # ── VO row ────────────────────────────────────────────────────────
         if ltype == "vo":
-            row_fill = FILLS["vo"]
-            # Strip ~ prefix for display, note it
             display_in  = tc_in.lstrip("~")
             display_out = tc_out.lstrip("~")
             if tc_in.startswith("~") and not notes:
                 notes = "⚠ TC estimated — check against cut"
-            # Sanity check: if duration < 1 second, something went wrong
             try:
                 def _s(tc):
-                    p=tc.lstrip("~").replace(";",":").split(":")
+                    p = tc.lstrip("~").replace(";",":").split(":")
                     return int(p[0])*3600+int(p[1])*60+int(p[2])+int(p[3])/25
-                if dur and (_s(display_out)-_s(display_in)) < 1.0:
+                if dur and (_s(display_out) - _s(display_in)) < 1.0:
                     if not notes: notes = "⚠ Duration <1s — check TC"
             except: pass
 
-            script_text = "VO: " + text.replace(" / ", "\n")
+            script_text = "VO: " + text
 
             values = [display_in, display_out, dur, script_text, notes]
             for col, val in enumerate(values, 1):
                 cell = ws.cell(row=row_num, column=col, value=val)
-                cell.fill      = row_fill
+                cell.fill      = FILLS["vo"]
                 cell.border    = border()
                 cell.alignment = align()
                 if col == 4:
@@ -1154,37 +1158,38 @@ def build_output_xlsx(matched_lines, output_path, fps):
                     cell.font = Font(name="Calibri", size=10,
                                      italic=is_warn,
                                      color="CC0000" if is_warn else "000000")
-
-            # Highlight wording warnings in red
             if notes and "WORDING" in notes:
                 ws.cell(row=row_num, column=5).font = Font(
                     name="Calibri", size=10, color="CC0000")
-
-            ws.row_dimensions[row_num].height = max(
-                15, min(15 * (text.count("/") + 1), 60))
+            ws.row_dimensions[row_num].height = 15
+            prev_type = ltype
             row_num += 1
             continue
 
         # ── Actuality row ─────────────────────────────────────────────────
-        row_fill = FILLS["act"]
+        # First line of a consecutive actuality group gets "Actuality:" prefix
+        is_first_act = (prev_type != "act")
         if speaker:
-            script_text = f"Actuality: {speaker}: {text}"
+            if is_first_act:
+                script_text = f"Actuality: {speaker}: {text}"
+            else:
+                script_text = f"{speaker}: {text}"
         else:
-            script_text = f"Actuality: {text}"
+            if is_first_act:
+                script_text = f"Actuality: {text}"
+            else:
+                script_text = text
 
         for col, val in enumerate(["", "", "", script_text, ""], 1):
             cell = ws.cell(row=row_num, column=col, value=val)
-            cell.fill      = row_fill
+            cell.fill      = FILLS["act"]
             cell.border    = border()
             cell.alignment = align()
-            if col == 4:
-                cell.font = Font(name="Calibri", size=10, italic=True,
-                                 color="444444")
-            else:
-                cell.font = font()
+            cell.font      = Font(name="Calibri", size=10,
+                                  italic=(col == 4), color="444444" if col == 4 else "000000")
 
-        ws.row_dimensions[row_num].height = max(
-            15, min(15 * (text.count("\n") + 1), 80))
+        ws.row_dimensions[row_num].height = 15
+        prev_type = ltype
         row_num += 1
 
     wb.save(str(output_path))
