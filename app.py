@@ -96,11 +96,8 @@ def parse_source_script(docx_path):
             f"File appears to be a OneDrive placeholder ({p.stat().st_size} bytes). "
             "Right-click → 'Always keep on this device', then retry."
         )
-    import tempfile, shutil
-    tmp = Path(tempfile.mkdtemp()) / "source.docx"
-    shutil.copy2(str(p), str(tmp))
     try:
-        doc = Document(str(tmp))
+        doc = Document(str(p))
     except Exception as e:
         raise RuntimeError(f"Cannot open script (is it open in Word?): {e}")
 
