@@ -137,106 +137,127 @@ def parse_source_script(docx_path):
         return False
 
     def classify_content_cell(cell, pending_note=""):
-        """Parse right-hand content cell. Returns list of line dicts."""
-        results = []
-        paras   = cell.paragraphs
-        i       = 0
-        first   = True
-        while i < len(paras):
+        """
+        Parse right-hand content cell of a script row.
+        Bold uppercase → VO.  Italic or plain text → Actuality.
+        "VO:" paragraph (header marker) → skip, next bold para is the VO text.
+        "COMM" → skip.
+        "Actuality:" paragraph (header marker) → skip, next para is actuality.
+        Section labels are NEVER emitted here — they only come from col 0.
+        """
+        results  = []
+        paras    = cell.paragraphs
+        n        = len(paras)
+        i        = 0
+        first    = True
+        skip_next_as_vo  = False   # set True after a bare "VO:" para
+        skip_next_as_act = False   # set True after a bare "Actuality:" para
+
+        while i < n:
             para = paras[i]
             text = para.text.strip()
+
             if not text:
                 i += 1; continue
 
             bold   = is_bold(para)
             italic = is_italic(para)
 
-            # Label keywords in content cell → section header, no TC
-            if is_label(text) and bold:
-                results.append({
-                    "type":    "section",
-                    "speaker": None,
-                    "text":    text,
-                    "notes":   "",
-                })
-                i += 1; first = False; continue
+            # ── Skip COMM entirely ────────────────────────────────────────
+            if text.upper() == "COMM":
+                i += 1; continue
 
-            # VO: bold AND uppercase, OR all-uppercase short phrase not italic
-            # (handles cases where bold is set at style level not run level)
-            looks_vo = (bold and text == text.upper() and len(text) > 2) or (
-                       not italic and text == text.upper() and len(text) > 2
-                       and not re.match(r'^[A-Z][A-Z0-9 .\-]+: ', text))
-            if looks_vo and not is_label(text):
+            # ── Bare "VO:" paragraph — next content is VO ─────────────────
+            if text.upper() in ("VO:", "VO") and bold:
+                skip_next_as_vo  = True
+                skip_next_as_act = False
+                i += 1; continue
+
+            # ── Bare "Actuality:" paragraph — next content is actuality ───
+            if text.lower().strip(":") == "actuality":
+                skip_next_as_act = True
+                skip_next_as_vo  = False
+                i += 1; continue
+
+            # ── Forced VO (preceded by bare "VO:") ───────────────────────
+            if skip_next_as_vo:
+                skip_next_as_vo = False
+                # Collect consecutive bold paragraphs as separate VO lines
                 block = [text]
-                while i + 1 < len(paras):
+                while i + 1 < n:
                     nxt = paras[i + 1]
                     nt  = nxt.text.strip()
-                    nxt_italic = is_italic(nxt)
-                    if nt and nt == nt.upper() and not is_label(nt) and not nxt_italic:
+                    if nt and nt.upper() not in ("VO:", "VO", "COMM") and not is_italic(nxt):
+                        if nt == nt.upper() and len(nt) > 2:
+                            block.append(nt); i += 1
+                        else:
+                            break
+                    else:
+                        break
+                for bi, vo_text in enumerate(block):
+                    note = pending_note if (first and bi == 0) else ""
+                    results.append({"type": "vo", "speaker": None,
+                                    "text": vo_text, "notes": note})
+                first = False; i += 1; continue
+
+            # ── Forced actuality (preceded by bare "Actuality:") ──────────
+            if skip_next_as_act:
+                skip_next_as_act = False
+                m = re.match(r'^([A-Z][A-Z0-9 .\-]+):\s*(.*)', text)
+                if m:
+                    results.append({"type": "act", "speaker": m.group(1).strip(),
+                                    "text": m.group(2).strip(), "notes": ""})
+                else:
+                    results.append({"type": "act", "speaker": None,
+                                    "text": text, "notes": ""})
+                i += 1; continue
+
+            # ── VO: bold OR all-uppercase (in content cell = always VO) ───
+            # Note: is_label() is NOT used here — in the content column,
+            # short all-caps text IS VO, not a section header.
+            is_vo = (bold or (text == text.upper())) and len(text) > 2 and not italic
+            # Exclude SPEAKER: pattern from VO
+            if is_vo and re.match(r'^[A-Z][A-Z0-9 .\-]+:\s', text):
+                is_vo = False
+
+            if is_vo:
+                block = [text]
+                while i + 1 < n:
+                    nxt = paras[i + 1]
+                    nt  = nxt.text.strip()
+                    if (nt and nt == nt.upper() and len(nt) > 2
+                            and not is_italic(nxt)
+                            and nt.upper() not in ("VO:", "VO", "COMM")
+                            and not re.match(r'^[A-Z][A-Z0-9 .\-]+:\s', nt)):
                         block.append(nt); i += 1
                     else:
                         break
-                # Emit each VO paragraph as a SEPARATE line
-                # so each one gets its own EDL event / TC
                 for bi, vo_text in enumerate(block):
                     note = pending_note if (first and bi == 0) else ""
-                    results.append({
-                        "type":    "vo",
-                        "speaker": None,
-                        "text":    vo_text,
-                        "notes":   note,
-                    })
-                first = False
+                    results.append({"type": "vo", "speaker": None,
+                                    "text": vo_text, "notes": note})
+                first = False; i += 1; continue
 
-            # Actuality: italic or SPEAKER: pattern
-            elif italic or re.match(r'^[A-Z][A-Z0-9 .\-]+: ', text):
-                m = re.match(r'^([A-Z][A-Z0-9\s\.\-]+):\s*(.*)', text)
-                if m:
-                    speaker = m.group(1).strip()
-                    diag    = m.group(2).strip()
-                    block   = [diag] if diag else []
-                    while i + 1 < len(paras):
-                        nxt = paras[i + 1]
-                        nt  = nxt.text.strip()
-                        if (not nt
-                                or re.match(r'^[A-Z][A-Z0-9 .\-]+: ', nt)
-                                or (is_bold(nxt) and nt == nt.upper())):
-                            break
-                        block.append(nt); i += 1
-                    results.append({
-                        "type":    "act",
-                        "speaker": speaker,
-                        "text":    " ".join(block),
-                        "notes":   "",
-                    })
-                else:
-                    results.append({
-                        "type":    "act",
-                        "speaker": None,
-                        "text":    text,
-                        "notes":   "",
-                    })
-                first = False
-
-            elif bold:
-                note = pending_note if first else ""
-                results.append({
-                    "type":    "vo",
-                    "speaker": None,
-                    "text":    text,
-                    "notes":   note,
-                })
-                first = False
+            # ── Actuality: italic, SPEAKER: pattern, or plain text ────────
+            m = re.match(r'^([A-Z][A-Z0-9 .\-]+):\s*(.*)', text)
+            if m:
+                speaker = m.group(1).strip()
+                diag    = m.group(2).strip()
+                block   = [diag] if diag else []
+                while i + 1 < n:
+                    nxt = paras[i + 1]
+                    nt  = nxt.text.strip()
+                    if (not nt
+                            or re.match(r'^[A-Z][A-Z0-9 .\-]+:\s', nt)
+                            or (nt == nt.upper() and len(nt) > 2 and not is_italic(nxt))):
+                        break
+                    block.append(nt); i += 1
+                results.append({"type": "act", "speaker": speaker,
+                                "text": " ".join(block), "notes": ""})
             else:
-                results.append({
-                    "type":    "act",
-                    "speaker": None,
-                    "text":    text,
-                    "notes":   "",
-                })
-                first = False
-
-            i += 1
+                results.append({"type": "act", "speaker": None,
+                                "text": text, "notes": ""})
+            first = False; i += 1
 
         for r in results:
             r.setdefault("notes", "")
