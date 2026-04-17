@@ -824,30 +824,25 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
 def match_three_input(script_lines, edl_events, audio_segments,
                       tc_offset_secs, fps, log_fn=print):
     """
-    Matching strategy:
+    Sequential matching.
 
-    PRIMARY  — Whisper audio (VO channel).
-               Each script VO line is searched in the transcript.
-               Key rules:
-               - Cursor only advances on HIGH-confidence matches (score >= 0.25)
-               - Low-confidence matches (0.08-0.25) get a TC but cursor stays
-                 put so subsequent searches aren't pushed past real content
-               - No match: blank TC, cursor stays put
+    The VO wav file contains VO lines in programme order with silence between.
+    Whisper produces those lines in order with timestamps.
+    The script has VO lines in the same order.
 
-    VERIFY   — EDL cross-check (when EDL provided).
-               If an EDL event falls within 2s of Whisper position, use that
-               frame-accurate TC instead.
-
-    FALLBACK — Sequential EDL (no audio).
+    Strategy:
+    1. Extract Whisper segments that contain real speech (skip silence gaps)
+    2. Walk script VO lines and Whisper segments together in parallel
+    3. Small lookahead (5 segments) for robustness — if script line doesn't
+       match current Whisper segment well, try the next few before giving up
+    4. TC = Whisper word-accurate timestamp + tc_offset
+    5. EDL cross-check: if EDL event is within 2s, use frame-accurate EDL TC
 
     Actuality lines always get blank TCs.
     """
     WORDING_THRESHOLD = 0.15
     EDL_VERIFY_SECS   = 2.0
-    LOOKAHEAD         = 120   # segments to search ahead from cursor
-    WINDOW            = 10    # segments to join when building a match string
-    HI_THRESHOLD      = 0.25  # confident match — advance cursor
-    LO_THRESHOLD      = 0.08  # low-confidence — use TC but don't advance cursor
+    LOOKAHEAD         = 8     # small — content is sequential
 
     results = []
 
@@ -859,8 +854,6 @@ def match_three_input(script_lines, edl_events, audio_segments,
     else:
         vo_segs = []
 
-    n_vo      = len(vo_segs)
-    vo_cursor = 0
     total_dur = vo_segs[-1]["end"] if vo_segs else 0.0
 
     # ── EDL lookup ─────────────────────────────────────────────────────────
@@ -886,24 +879,33 @@ def match_three_input(script_lines, edl_events, audio_segments,
                 best_diff = diff; best = (t_in, t_out, ev)
         return best
 
-    def search_whisper(norm_text, cursor):
-        """Search from cursor for best matching segment span.
-        Returns (score, bi, bj) — does NOT modify cursor."""
-        if cursor >= n_vo:
-            return 0.0, None, None
-        best_score = 0.0; best_i = best_j = None
-        end = min(cursor + LOOKAHEAD, n_vo)
-        for i in range(cursor, end):
-            joined = ""
-            for j in range(i, min(i + WINDOW, end)):
-                joined = (joined + " " + vo_segs[j]["text"]).strip()
-                score  = similarity(normalize(norm_text), normalize(joined))
-                # Boost: script text is a substring of transcript
-                if len(norm_text) > 8 and normalize(norm_text) in normalize(joined):
-                    score = max(score, 0.85)
-                if score > best_score:
-                    best_score = score; best_i = i; best_j = j
-        return best_score, best_i, best_j
+    # ── Merge short Whisper segments into speech blocks ────────────────────
+    # Whisper sometimes splits one VO line into multiple segments.
+    # Merge segments that are close together (< 1.5s gap) into blocks.
+    MERGE_GAP = 1.5  # seconds — gap smaller than this = same speech block
+
+    blocks = []
+    if vo_segs:
+        cur_block = {"start": vo_segs[0]["start"],
+                     "end":   vo_segs[0]["end"],
+                     "text":  vo_segs[0]["text"].strip()}
+        for seg in vo_segs[1:]:
+            gap = seg["start"] - cur_block["end"]
+            if gap < MERGE_GAP:
+                # Same speech block — extend it
+                cur_block["end"]  = seg["end"]
+                cur_block["text"] = (cur_block["text"] + " " + seg["text"]).strip()
+            else:
+                blocks.append(cur_block)
+                cur_block = {"start": seg["start"],
+                             "end":   seg["end"],
+                             "text":  seg["text"].strip()}
+        blocks.append(cur_block)
+
+    log_fn(f"  Whisper: {len(vo_segs)} segments merged into {len(blocks)} speech blocks")
+
+    n_blocks    = len(blocks)
+    blk_cursor  = 0
 
     # ── Main pass ─────────────────────────────────────────────────────────
     edl_seq_idx = 0
@@ -925,21 +927,35 @@ def match_three_input(script_lines, edl_events, audio_segments,
         tc_in = tc_out = dur = note = ""
         t_in_raw = None
 
-        if vo_segs:
-            score, bi, bj = search_whisper(normalize(text), vo_cursor)
+        if blocks and blk_cursor < n_blocks:
+            # Search within a small window from current cursor
+            norm_script = normalize(text)
+            best_score  = 0.0; best_blk = None; best_idx = None
+            search_end  = min(blk_cursor + LOOKAHEAD, n_blocks)
 
-            if score >= LO_THRESHOLD and bi is not None:
-                w_in  = vo_segs[bi]["start"]
-                w_out = vo_segs[bj]["end"]
+            for bi in range(blk_cursor, search_end):
+                blk   = blocks[bi]
+                score = similarity(norm_script, normalize(blk["text"]))
+                # Boost if script text is contained in block text
+                if len(norm_script) > 8 and norm_script in normalize(blk["text"]):
+                    score = max(score, 0.85)
+                # Boost if significant word overlap
+                script_words = set(norm_script.split())
+                block_words  = set(normalize(blk["text"]).split())
+                if len(script_words) > 2:
+                    overlap = len(script_words & block_words) / len(script_words)
+                    score   = max(score, overlap * 0.9)
+                if score > best_score:
+                    best_score = score; best_blk = blk; best_idx = bi
 
-                # Only advance cursor on confident match
-                if score >= HI_THRESHOLD:
-                    vo_cursor = bj + 1
+            if best_score >= 0.15 and best_blk is not None:
+                blk_cursor = best_idx + 1
+                w_in  = best_blk["start"]
+                w_out = best_blk["end"]
 
                 # Wording check
-                heard = " ".join(vo_segs[k]["text"].strip()
-                                 for k in range(bi, bj+1)).strip()
-                sim = similarity(normalize(text), normalize(heard))
+                heard = best_blk["text"]
+                sim   = similarity(normalize(text), normalize(heard))
                 if sim < (1 - WORDING_THRESHOLD):
                     s = text[:60] + ("..." if len(text) > 60 else "")
                     h = heard[:60] + ("..." if len(heard) > 60 else "")
@@ -964,8 +980,8 @@ def match_three_input(script_lines, edl_events, audio_segments,
 
         elif edl_events:
             if edl_seq_idx < len(edl_events):
-                ev       = edl_events[edl_seq_idx]; edl_seq_idx += 1
-                t_in_e   = tc_s(ev["rec_in"]); t_out_e = tc_s(ev["rec_out"])
+                ev = edl_events[edl_seq_idx]; edl_seq_idx += 1
+                t_in_e = tc_s(ev["rec_in"]); t_out_e = tc_s(ev["rec_out"])
                 tc_in    = ev["rec_in"]; tc_out = ev["rec_out"]
                 dur      = dur_str(max(t_out_e - t_in_e, 0))
                 t_in_raw = t_in_e
@@ -977,7 +993,7 @@ def match_three_input(script_lines, edl_events, audio_segments,
         results.append({**line, "tc_in": tc_in, "tc_out": tc_out, "dur": dur,
                         "_match_note": note, "_t_in": t_in_raw})
 
-    # ── Interpolation for remaining blanks ────────────────────────────────
+    # ── Interpolation ─────────────────────────────────────────────────────
     anchors = [(-1, 0.0)]
     for i, r in enumerate(results):
         if r.get("_t_in") is not None:
@@ -1015,11 +1031,8 @@ def match_three_input(script_lines, edl_events, audio_segments,
     n_interp = sum(1 for r in results if "estimated" in r.get("_match_note",""))
     n_warn   = sum(1 for r in results if "WORDING" in r.get("_match_note",""))
     n_miss   = sum(1 for r in results if "NOT FOUND" in r.get("_match_note",""))
-    log_fn(f"Match: {n_conf} EDL-verified | {n_tilde} Whisper | "
-           f"{n_interp} estimated (~) | {n_warn} wording ⚠ | {n_miss} NOT FOUND")
-
-    for r in results:
-        r.pop("_t_in", None)
+    log_fn(f"Match: {n_conf} EDL-verified | {n_tilde} Whisper (~) | "
+           f"{n_interp} estimated | {n_warn} wording ⚠ | {n_miss} NOT FOUND")
     return results
 
 
