@@ -138,108 +138,147 @@ def parse_source_script(docx_path):
 
     def classify_content_cell(cell, pending_note=""):
         """
-        Parse right-hand content cell of a script row.
-        Bold uppercase → VO.  Italic or plain text → Actuality.
-        "VO:" paragraph (header marker) → skip, next bold para is the VO text.
-        "COMM" → skip.
-        "Actuality:" paragraph (header marker) → skip, next para is actuality.
-        Section labels are NEVER emitted here — they only come from col 0.
+        Parse the right-hand content cell.
+
+        Rules (in order):
+        1. Empty paragraph → skip
+        2. Text is "COMM" or "COMM:" → skip (script marker)
+        3. Text is bare "VO:" or "VO" (bold) → skip, flag next para as forced VO
+        4. Text is bare "Actuality:" → skip, flag next para as forced actuality
+        5. SPEAKER: pattern (e.g. "OFFICER:", "WOMAN:", "ALLENGER:") →
+           actuality, even if bold/uppercase. A line ending with ":" whose
+           text before ":" is all caps = speaker label.
+        6. Bold OR all-uppercase text (not italic, not speaker label) → VO
+        7. Everything else → actuality
         """
-        results  = []
-        paras    = cell.paragraphs
-        n        = len(paras)
-        i        = 0
-        first    = True
-        skip_next_as_vo  = False   # set True after a bare "VO:" para
-        skip_next_as_act = False   # set True after a bare "Actuality:" para
+        results          = []
+        paras            = cell.paragraphs
+        n                = len(paras)
+        i                = 0
+        first            = True
+        force_vo         = False
+        force_act        = False
+
+        SPEAKER_RE = re.compile(r'^([A-Z][A-Z0-9 .\\-]{0,30}):\\s*(.*)')
+
+        def is_speaker_label(txt):
+            """True if txt is just a speaker name with colon e.g. 'OFFICER:'"""
+            m = SPEAKER_RE.match(txt)
+            if not m:
+                return False
+            before_colon = m.group(1).strip()
+            # Speaker label: all caps, 1-4 words, no lowercase
+            words = before_colon.split()
+            return (len(words) <= 4
+                    and before_colon == before_colon.upper()
+                    and len(before_colon) > 1)
 
         while i < n:
             para = paras[i]
             text = para.text.strip()
-
             if not text:
                 i += 1; continue
 
             bold   = is_bold(para)
             italic = is_italic(para)
+            upper  = (text == text.upper() and len(text) > 2)
 
-            # ── Skip COMM entirely ────────────────────────────────────────
-            if text.upper() == "COMM":
+            # ── 2. Skip COMM / COMM: ─────────────────────────────────────
+            if text.upper().rstrip(':') == 'COMM':
+                force_vo = False; force_act = False
                 i += 1; continue
 
-            # ── Bare "VO:" paragraph — next content is VO ─────────────────
-            if text.upper() in ("VO:", "VO") and bold:
-                skip_next_as_vo  = True
-                skip_next_as_act = False
+            # ── 3. Bare VO: marker ────────────────────────────────────────
+            if text.upper().rstrip(':') == 'VO' and (bold or upper):
+                force_vo = True; force_act = False
                 i += 1; continue
 
-            # ── Bare "Actuality:" paragraph — next content is actuality ───
-            if text.lower().strip(":") == "actuality":
-                skip_next_as_act = True
-                skip_next_as_vo  = False
+            # ── 4. Bare Actuality: marker ─────────────────────────────────
+            if text.lower().rstrip(':').strip() == 'actuality':
+                force_act = True; force_vo = False
                 i += 1; continue
 
-            # ── Forced VO (preceded by bare "VO:") ───────────────────────
-            if skip_next_as_vo:
-                skip_next_as_vo = False
-                # Collect consecutive bold paragraphs as separate VO lines
-                block = [text]
+            # ── 5. Speaker label (OFFICER:, WOMAN: etc.) ──────────────────
+            # Always actuality regardless of bold/uppercase
+            if is_speaker_label(text):
+                force_act = True; force_vo = False
+                # Speaker name becomes the speaker field
+                m = SPEAKER_RE.match(text)
+                speaker_name = m.group(1).strip()
+                diag         = m.group(2).strip()
+                # Collect following dialogue lines
+                block = [diag] if diag else []
                 while i + 1 < n:
                     nxt = paras[i + 1]
                     nt  = nxt.text.strip()
-                    if nt and nt.upper() not in ("VO:", "VO", "COMM") and not is_italic(nxt):
-                        if nt == nt.upper() and len(nt) > 2:
-                            block.append(nt); i += 1
-                        else:
-                            break
-                    else:
+                    if not nt:
+                        i += 1; continue
+                    # Stop if next line is another speaker, VO, or COMM
+                    if (is_speaker_label(nt)
+                            or nt.upper().rstrip(':') in ('VO', 'COMM')
+                            or nt.lower().rstrip(':').strip() == 'actuality'
+                            or (nt == nt.upper() and len(nt) > 2 and is_bold(nxt) and not is_speaker_label(nt))):
                         break
-                for bi, vo_text in enumerate(block):
-                    note = pending_note if (first and bi == 0) else ""
-                    results.append({"type": "vo", "speaker": None,
-                                    "text": vo_text, "notes": note})
-                first = False; i += 1; continue
+                    block.append(nt); i += 1
+                results.append({'type': 'act', 'speaker': speaker_name,
+                                'text': ' '.join(block), 'notes': ''})
+                force_act = False; first = False; i += 1; continue
 
-            # ── Forced actuality (preceded by bare "Actuality:") ──────────
-            if skip_next_as_act:
-                skip_next_as_act = False
-                m = re.match(r'^([A-Z][A-Z0-9 .\-]+):\s*(.*)', text)
-                if m:
-                    results.append({"type": "act", "speaker": m.group(1).strip(),
-                                    "text": m.group(2).strip(), "notes": ""})
-                else:
-                    results.append({"type": "act", "speaker": None,
-                                    "text": text, "notes": ""})
-                i += 1; continue
-
-            # ── VO: bold OR all-uppercase (in content cell = always VO) ───
-            # Note: is_label() is NOT used here — in the content column,
-            # short all-caps text IS VO, not a section header.
-            is_vo = (bold or (text == text.upper())) and len(text) > 2 and not italic
-            # Exclude SPEAKER: pattern from VO
-            if is_vo and re.match(r'^[A-Z][A-Z0-9 .\-]+:\s', text):
-                is_vo = False
-
-            if is_vo:
+            # ── Force VO (after bare VO: marker) ─────────────────────────
+            if force_vo:
+                force_vo = False
                 block = [text]
                 while i + 1 < n:
                     nxt = paras[i + 1]
                     nt  = nxt.text.strip()
                     if (nt and nt == nt.upper() and len(nt) > 2
                             and not is_italic(nxt)
-                            and nt.upper() not in ("VO:", "VO", "COMM")
-                            and not re.match(r'^[A-Z][A-Z0-9 .\-]+:\s', nt)):
+                            and nt.upper().rstrip(':') not in ('VO','COMM')
+                            and not nt.lower().rstrip(':').strip() == 'actuality'
+                            and not is_speaker_label(nt)):
                         block.append(nt); i += 1
                     else:
                         break
                 for bi, vo_text in enumerate(block):
-                    note = pending_note if (first and bi == 0) else ""
-                    results.append({"type": "vo", "speaker": None,
-                                    "text": vo_text, "notes": note})
+                    note = pending_note if (first and bi == 0) else ''
+                    results.append({'type': 'vo', 'speaker': None,
+                                    'text': vo_text, 'notes': note})
                 first = False; i += 1; continue
 
-            # ── Actuality: italic, SPEAKER: pattern, or plain text ────────
-            m = re.match(r'^([A-Z][A-Z0-9 .\-]+):\s*(.*)', text)
+            # ── Force actuality (after bare Actuality: marker) ────────────
+            if force_act:
+                force_act = False
+                m = SPEAKER_RE.match(text)
+                if m:
+                    results.append({'type': 'act', 'speaker': m.group(1).strip(),
+                                    'text': m.group(2).strip(), 'notes': ''})
+                else:
+                    results.append({'type': 'act', 'speaker': None,
+                                    'text': text, 'notes': ''})
+                first = False; i += 1; continue
+
+            # ── 6. VO: bold or all-uppercase, not italic, not speaker ─────
+            if (bold or upper) and not italic and not is_speaker_label(text):
+                block = [text]
+                while i + 1 < n:
+                    nxt = paras[i + 1]
+                    nt  = nxt.text.strip()
+                    if (nt and nt == nt.upper() and len(nt) > 2
+                            and not is_italic(nxt)
+                            and nt.upper().rstrip(':') not in ('VO','COMM')
+                            and not nt.lower().rstrip(':').strip() == 'actuality'
+                            and not is_speaker_label(nt)):
+                        block.append(nt); i += 1
+                    else:
+                        break
+                for bi, vo_text in enumerate(block):
+                    note = pending_note if (first and bi == 0) else ''
+                    results.append({'type': 'vo', 'speaker': None,
+                                    'text': vo_text, 'notes': note})
+                first = False; i += 1; continue
+
+            # ── 7. Actuality (italic or plain text) ───────────────────────
+            m = SPEAKER_RE.match(text)
             if m:
                 speaker = m.group(1).strip()
                 diag    = m.group(2).strip()
@@ -247,20 +286,19 @@ def parse_source_script(docx_path):
                 while i + 1 < n:
                     nxt = paras[i + 1]
                     nt  = nxt.text.strip()
-                    if (not nt
-                            or re.match(r'^[A-Z][A-Z0-9 .\-]+:\s', nt)
+                    if (not nt or is_speaker_label(nt)
                             or (nt == nt.upper() and len(nt) > 2 and not is_italic(nxt))):
                         break
                     block.append(nt); i += 1
-                results.append({"type": "act", "speaker": speaker,
-                                "text": " ".join(block), "notes": ""})
+                results.append({'type': 'act', 'speaker': speaker,
+                                'text': ' '.join(block), 'notes': ''})
             else:
-                results.append({"type": "act", "speaker": None,
-                                "text": text, "notes": ""})
+                results.append({'type': 'act', 'speaker': None,
+                                'text': text, 'notes': ''})
             first = False; i += 1
 
         for r in results:
-            r.setdefault("notes", "")
+            r.setdefault('notes', '')
         return results
 
     # ── Find script table ─────────────────────────────────────────────────────
@@ -292,17 +330,11 @@ def parse_source_script(docx_path):
         left  = cells[0].text.strip().strip("*").strip()
         right = cells[1].text.strip()
 
-        # Skip document title block (first row containing programme metadata)
-        if first_row and right:
-            right_upper = right.upper()
-            if any(kw in right_upper for kw in [
-                "COMPILATION:", "PRODUCTION NUMBER", "PRODUCTION TITLE",
-                "SERIES / EPISODE", "VO SCRIPT", "VERSION", "DATE:",
-                "DISCOVERY VIEWING", "NAT GEO", "DISCOVERY CHANNEL"
-            ]):
-                first_row = False
-                continue
+        # Always skip the first table row — it is always the title block
+        # (programme name, version, date, PL SCRIPT etc.)
+        if first_row:
             first_row = False
+            continue
 
         # Left column — ONLY use for scene/segment header names.
         # ALL editorial notes, SG comments, production notes are IGNORED.
