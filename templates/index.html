@@ -284,6 +284,16 @@
       <div class="dz-hint">Export from Avid: Output → Export EDL → CMX 3600, VO track only</div>
       <div class="dz-name" id="edlName"></div>
     </div>
+
+    <div style="text-align:center;color:var(--txt2);font-size:12px;margin:-4px 0 8px">— or —</div>
+
+    <div class="drop-zone" id="dzCsv">
+      <input type="file" id="csvFile" accept=".csv" />
+      <div class="dz-icon">📝</div>
+      <div class="dz-label">Premiere Pro Transcript CSV</div>
+      <div class="dz-hint">Most accurate — File → Export → Captions → CSV from Premiere speech-to-text</div>
+      <div class="dz-name" id="csvName"></div>
+    </div>
   </div>
 
   <!-- Settings -->
@@ -400,6 +410,7 @@
   setupDropZone("dzScript", "scriptFile", "scriptName");
   setupDropZone("dzVideo",  "videoFile",  "videoName");
   setupDropZone("dzEdl",    "edlFile",    "edlName");
+  setupDropZone("dzCsv",    "csvFile",    "csvName");
 
   // Also enable run button when name is entered
   document.getElementById("userName").addEventListener("input", checkReady);
@@ -410,7 +421,8 @@
     const hasScript = !!document.getElementById("scriptFile").files[0];
     const hasVideo  = !!document.getElementById("videoFile").files[0];
     const hasEdl    = !!document.getElementById("edlFile").files[0];
-    const hasAudio  = hasVideo || hasEdl;
+    const hasCsv    = !!document.getElementById("csvFile").files[0];
+    const hasAudio  = hasVideo || hasEdl || hasCsv;
     const hasName   = document.getElementById("userName").value.trim().length > 0;
     const keyEl     = document.getElementById("apiKey");
     const hasKey    = !keyEl || keyEl.value.trim().startsWith("sk-");
@@ -449,6 +461,8 @@
     if (apiKey) form.append("api_key", apiKey);
     const edlFileEl = document.getElementById("edlFile").files[0];
     if (edlFileEl) form.append("edl", edlFileEl);
+    const csvFileEl = document.getElementById("csvFile").files[0];
+    if (csvFileEl) form.append("csv", csvFileEl);
 
     let resp;
     try {
