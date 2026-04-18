@@ -415,6 +415,113 @@ def parse_edl(edl_path, fps=25):
     return sorted(unique, key=lambda e: e["rec_in"])
 
 
+def parse_premiere_csv(csv_path, fps=25):
+    """
+    Parse a Premiere Pro speech-to-text CSV export.
+    Format: Speaker Name, Start Time, End Time, Text
+    Time format: HH:MM:SS:FF
+    Returns list of {start_secs, end_secs, tc_in, tc_out, text}
+    """
+    import csv as _csv
+    entries = []
+    def tc_s(tc):
+        try:
+            p = tc.strip().replace(";",":").split(":")
+            return int(p[0])*3600+int(p[1])*60+int(p[2])+int(p[3])/fps
+        except: return None
+
+    with open(csv_path, encoding="utf-8-sig", errors="replace") as f:
+        reader = _csv.reader(f)
+        for row in reader:
+            if len(row) < 4: continue
+            tc_in_str  = row[1].strip()
+            tc_out_str = row[2].strip()
+            text       = row[3].strip()
+            if not text or not tc_in_str or tc_in_str == "Start Time":
+                continue
+            t_in  = tc_s(tc_in_str)
+            t_out = tc_s(tc_out_str)
+            if t_in is None: continue
+            entries.append({
+                "start_secs": t_in,
+                "end_secs":   t_out or (t_in + 5.0),
+                "tc_in":      tc_in_str,
+                "tc_out":     tc_out_str,
+                "text":       text,
+            })
+    return sorted(entries, key=lambda x: x["start_secs"])
+
+
+def match_from_premiere_csv(script_lines, csv_entries, fps):
+    """
+    Match script VO lines to Premiere CSV transcript entries.
+    Uses word-overlap scoring to find the right CSV entry for each VO line.
+    Sequential — cursor only moves forward.
+    """
+    STOP = {'a','an','the','and','or','of','in','is','are','was',
+            'were','to','for','at','by','on','with','that','this',
+            'it','its','as','be','been','has','have','had'}
+
+    results = []
+    csv_cursor = 0
+    n_csv = len(csv_entries)
+    LOOKAHEAD = 5
+
+    def key_words(text):
+        return [w for w in normalize(text).split()
+                if w not in STOP and len(w) > 2] or normalize(text).split()
+
+    for line in script_lines:
+        ltype = line.get("type","act")
+        text  = line.get("text","").strip()
+
+        if ltype in ("section","part","coda") or not text:
+            results.append({**line,"tc_in":"","tc_out":"","dur":"",
+                            "_match_note":"","_t_in":None})
+            continue
+        if ltype != "vo":
+            results.append({**line,"tc_in":"","tc_out":"","dur":"",
+                            "_match_note":"","_t_in":None})
+            continue
+
+        script_kw = key_words(text)
+        n_kw = len(script_kw)
+        best_score = 0.0; best_entry = None; best_idx = None
+
+        for ci in range(csv_cursor, min(csv_cursor + LOOKAHEAD, n_csv)):
+            entry = csv_entries[ci]
+            entry_words = set(key_words(entry["text"]))
+            matched = sum(1 for w in script_kw if w in entry_words)
+            score = matched / n_kw if n_kw else 0
+            score = max(score, similarity(normalize(text),
+                                          normalize(entry["text"])))
+            if score > best_score:
+                best_score = score; best_entry = entry; best_idx = ci
+
+        if best_score >= 0.30 and best_entry:
+            csv_cursor = best_idx + 1
+            results.append({**line,
+                "tc_in":  best_entry["tc_in"],
+                "tc_out": best_entry["tc_out"],
+                "dur":    dur_str(best_entry["end_secs"] -
+                                  best_entry["start_secs"]),
+                "_match_note": "",
+                "_t_in": best_entry["start_secs"],
+            })
+        else:
+            results.append({**line,"tc_in":"","tc_out":"","dur":"",
+                            "_match_note":"NOT FOUND in transcript",
+                            "_t_in":None})
+
+    n_matched = sum(1 for r in results if r.get("type")=="vo" and r.get("tc_in"))
+    n_miss    = sum(1 for r in results if r.get("type")=="vo" and not r.get("tc_in"))
+    print(f"Premiere CSV match: {n_matched} matched | {n_miss} NOT FOUND")
+
+    for r in results:
+        r.pop("_t_in",None)
+    return results
+
+
 def match_from_edl(script_lines, edl_events, fps):
     """
     Match VO lines to EDL events by sequence order.
@@ -474,9 +581,9 @@ def match_from_edl(script_lines, edl_events, fps):
 def transcribe_openai(audio_path, api_key):
     """
     Call OpenAI Whisper API with word-level timestamps.
-    Returns list of {start, end, text} — one entry per segment,
-    but start/end are taken from the first/last WORD in the segment
-    for frame-accurate timing rather than segment-level estimates.
+    Returns dict with:
+      "segments" — list of {start, end, text}
+      "words"    — list of {start, end, word} for word-level alignment
     """
     from openai import OpenAI
 
@@ -497,7 +604,6 @@ def transcribe_openai(audio_path, api_key):
             timestamp_granularities = ["segment", "word"]
         )
 
-    # Build word index: list of {start, end, word}
     words = []
     if hasattr(response, "words") and response.words:
         for w in response.words:
@@ -507,30 +613,22 @@ def transcribe_openai(audio_path, api_key):
                 "word":  w.word.strip(),
             })
 
-    # Map each segment to word-accurate start/end
     segments = []
-    word_idx = 0
     for seg in response.segments:
         seg_start = float(seg.start)
         seg_end   = float(seg.end)
-        seg_text  = seg.text.strip()
-
+        # Refine with word timestamps if available
         if words:
-            # Find words that fall within this segment
-            seg_words = [w for w in words
-                         if w["start"] >= seg_start - 0.1
-                         and w["end"]   <= seg_end   + 0.1]
-            if seg_words:
-                seg_start = seg_words[0]["start"]
-                seg_end   = seg_words[-1]["end"]
+            sw = [w for w in words
+                  if w["start"] >= seg_start - 0.1
+                  and w["end"]  <= seg_end   + 0.1]
+            if sw:
+                seg_start = sw[0]["start"]
+                seg_end   = sw[-1]["end"]
+        segments.append({"start": seg_start, "end": seg_end,
+                         "text": seg.text.strip()})
 
-        segments.append({
-            "start": seg_start,
-            "end":   seg_end,
-            "text":  seg_text,
-        })
-
-    return segments
+    return {"segments": segments, "words": words}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -824,37 +922,55 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
 def match_three_input(script_lines, edl_events, audio_segments,
                       tc_offset_secs, fps, log_fn=print):
     """
-    Sequential matching.
+    Word-level alignment matching.
 
-    The VO wav file contains VO lines in programme order with silence between.
-    Whisper produces those lines in order with timestamps.
-    The script has VO lines in the same order.
+    The VO wav contains all VO lines spoken in programme order.
+    Whisper gives us word-level timestamps.
 
-    Strategy:
-    1. Extract Whisper segments that contain real speech (skip silence gaps)
-    2. Walk script VO lines and Whisper segments together in parallel
-    3. Small lookahead (5 segments) for robustness — if script line doesn't
-       match current Whisper segment well, try the next few before giving up
-    4. TC = Whisper word-accurate timestamp + tc_offset
-    5. EDL cross-check: if EDL event is within 2s, use frame-accurate EDL TC
+    Algorithm:
+    1. Flatten Whisper words into a single ordered list
+    2. For each script VO line, find the best run of consecutive words
+       that matches the script text — starting from the current word cursor
+    3. TC In  = start time of the first matching word
+    4. TC Out = end time of the last matching word
+    5. Cursor advances past the matched words
 
-    Actuality lines always get blank TCs.
+    This works even when Whisper groups multiple VO lines into one segment,
+    because we match at word granularity regardless of segment boundaries.
+
+    EDL cross-check: if an EDL event is within 2s of the word-match position,
+    use the frame-accurate EDL TC instead.
     """
     WORDING_THRESHOLD = 0.15
     EDL_VERIFY_SECS   = 2.0
-    LOOKAHEAD         = 8     # small — content is sequential
 
     results = []
 
-    # ── Flatten audio ──────────────────────────────────────────────────────
+    # ── Unpack audio ───────────────────────────────────────────────────────
     if isinstance(audio_segments, dict):
-        vo_segs = audio_segments.get("vo", [])
-    elif audio_segments:
-        vo_segs = audio_segments
+        vo_words = audio_segments.get("vo_words", [])
+        vo_segs  = audio_segments.get("vo_segs",  audio_segments.get("vo", []))
+    elif isinstance(audio_segments, list):
+        vo_words = []
+        vo_segs  = audio_segments
     else:
-        vo_segs = []
+        vo_words = []
+        vo_segs  = []
 
-    total_dur = vo_segs[-1]["end"] if vo_segs else 0.0
+    # Fall back to segment midpoints if no words
+    if not vo_words and vo_segs:
+        for seg in vo_segs:
+            for w in seg["text"].split():
+                mid = (seg["start"] + seg["end"]) / 2
+                vo_words.append({"word": w, "start": seg["start"],
+                                 "end": seg["end"]})
+
+    n_words   = len(vo_words)
+    w_cursor  = 0
+    total_dur = vo_words[-1]["end"] if vo_words else (
+                vo_segs[-1]["end"] if vo_segs else 0.0)
+
+    log_fn(f"  Word-level alignment: {n_words} words available")
 
     # ── EDL lookup ─────────────────────────────────────────────────────────
     def tc_s(tc):
@@ -865,8 +981,7 @@ def match_three_input(script_lines, edl_events, audio_segments,
     for ev in edl_events:
         try:
             edl_by_time.append((tc_s(ev["rec_in"]), tc_s(ev["rec_out"]), ev))
-        except:
-            pass
+        except: pass
     edl_by_time.sort(key=lambda x: x[0])
     edl_used = set()
 
@@ -879,33 +994,59 @@ def match_three_input(script_lines, edl_events, audio_segments,
                 best_diff = diff; best = (t_in, t_out, ev)
         return best
 
-    # ── Merge short Whisper segments into speech blocks ────────────────────
-    # Whisper sometimes splits one VO line into multiple segments.
-    # Merge segments that are close together (< 1.5s gap) into blocks.
-    MERGE_GAP = 1.5  # seconds — gap smaller than this = same speech block
+    # ── Word-level search ──────────────────────────────────────────────────
+    def word_search(script_text, cursor):
+        """
+        Find the best matching run of words in vo_words starting from cursor.
+        Returns (score, start_idx, end_idx) or (0, None, None).
 
-    blocks = []
-    if vo_segs:
-        cur_block = {"start": vo_segs[0]["start"],
-                     "end":   vo_segs[0]["end"],
-                     "text":  vo_segs[0]["text"].strip()}
-        for seg in vo_segs[1:]:
-            gap = seg["start"] - cur_block["end"]
-            if gap < MERGE_GAP:
-                # Same speech block — extend it
-                cur_block["end"]  = seg["end"]
-                cur_block["text"] = (cur_block["text"] + " " + seg["text"]).strip()
-            else:
-                blocks.append(cur_block)
-                cur_block = {"start": seg["start"],
-                             "end":   seg["end"],
-                             "text":  seg["text"].strip()}
-        blocks.append(cur_block)
+        Strategy: extract key content words from script, find the window
+        of Whisper words with maximum overlap, allowing for paraphrasing.
+        """
+        if cursor >= n_words:
+            return 0.0, None, None
 
-    log_fn(f"  Whisper: {len(vo_segs)} segments merged into {len(blocks)} speech blocks")
+        # Script words (normalised, stop-words removed)
+        STOP = {'a','an','the','and','or','of','in','is','are','was',
+                'were','to','for','at','by','on','with','that','this',
+                'it','its','as','be','been','has','have','had'}
+        script_norm  = normalize(script_text)
+        script_words = [w for w in script_norm.split()
+                        if w not in STOP and len(w) > 2]
+        if not script_words:
+            script_words = script_norm.split()
+        n_sw = len(script_words)
 
-    n_blocks    = len(blocks)
-    blk_cursor  = 0
+        if n_sw == 0:
+            return 0.0, None, None
+
+        # Window size: script word count × 3 (allow for Whisper paraphrase)
+        win_size   = max(n_sw * 3, 10)
+        search_end = min(cursor + 200, n_words)   # look ahead up to 200 words
+
+        best_score = 0.0; best_si = best_ei = None
+
+        for si in range(cursor, search_end):
+            for ei in range(si + max(n_sw - 2, 1),
+                            min(si + win_size, search_end) + 1):
+                window_text  = " ".join(vo_words[k]["word"]
+                                        for k in range(si, ei))
+                window_norm  = normalize(window_text)
+                window_words = set(w for w in window_norm.split()
+                                   if w not in STOP and len(w) > 2)
+
+                # Score = fraction of script key words found in window
+                matched = sum(1 for sw in script_words if sw in window_words)
+                score   = matched / n_sw if n_sw else 0
+
+                # Boost with sequence similarity
+                seq_score = similarity(script_norm, window_norm)
+                score     = max(score, seq_score)
+
+                if score > best_score:
+                    best_score = score; best_si = si; best_ei = ei - 1
+
+        return best_score, best_si, best_ei
 
     # ── Main pass ─────────────────────────────────────────────────────────
     edl_seq_idx = 0
@@ -918,7 +1059,6 @@ def match_three_input(script_lines, edl_events, audio_segments,
             results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
                             "_match_note": "", "_t_in": None})
             continue
-
         if ltype != "vo":
             results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
                             "_match_note": "", "_t_in": None})
@@ -927,35 +1067,18 @@ def match_three_input(script_lines, edl_events, audio_segments,
         tc_in = tc_out = dur = note = ""
         t_in_raw = None
 
-        if blocks and blk_cursor < n_blocks:
-            # Search within a small window from current cursor
-            norm_script = normalize(text)
-            best_score  = 0.0; best_blk = None; best_idx = None
-            search_end  = min(blk_cursor + LOOKAHEAD, n_blocks)
+        if vo_words:
+            score, si, ei = word_search(text, w_cursor)
 
-            for bi in range(blk_cursor, search_end):
-                blk   = blocks[bi]
-                score = similarity(norm_script, normalize(blk["text"]))
-                # Boost if script text is contained in block text
-                if len(norm_script) > 8 and norm_script in normalize(blk["text"]):
-                    score = max(score, 0.85)
-                # Boost if significant word overlap
-                script_words = set(norm_script.split())
-                block_words  = set(normalize(blk["text"]).split())
-                if len(script_words) > 2:
-                    overlap = len(script_words & block_words) / len(script_words)
-                    score   = max(score, overlap * 0.9)
-                if score > best_score:
-                    best_score = score; best_blk = blk; best_idx = bi
-
-            if best_score >= 0.15 and best_blk is not None:
-                blk_cursor = best_idx + 1
-                w_in  = best_blk["start"]
-                w_out = best_blk["end"]
+            if score >= 0.40 and si is not None:
+                w_cursor = ei + 1
+                w_in  = vo_words[si]["start"]
+                w_out = vo_words[ei]["end"]
 
                 # Wording check
-                heard = best_blk["text"]
-                sim   = similarity(normalize(text), normalize(heard))
+                heard = " ".join(vo_words[k]["word"]
+                                 for k in range(si, ei+1))
+                sim = similarity(normalize(text), normalize(heard))
                 if sim < (1 - WORDING_THRESHOLD):
                     s = text[:60] + ("..." if len(text) > 60 else "")
                     h = heard[:60] + ("..." if len(heard) > 60 else "")
@@ -975,6 +1098,16 @@ def match_three_input(script_lines, edl_events, audio_segments,
                     tc_out   = "~" + seconds_to_tc(w_out, tc_offset_secs, fps)
                     dur      = dur_str(w_out - w_in)
                     t_in_raw = w_in
+            elif score >= 0.20 and si is not None:
+                # Low confidence — use TC but flag it
+                w_cursor = ei + 1
+                w_in  = vo_words[si]["start"]
+                w_out = vo_words[ei]["end"]
+                tc_in    = "~" + seconds_to_tc(w_in,  tc_offset_secs, fps)
+                tc_out   = "~" + seconds_to_tc(w_out, tc_offset_secs, fps)
+                dur      = dur_str(w_out - w_in)
+                t_in_raw = w_in
+                note     = "⚠ low-confidence match — check TC"
             else:
                 note = "NOT FOUND in audio"
 
@@ -998,8 +1131,7 @@ def match_three_input(script_lines, edl_events, audio_segments,
     for i, r in enumerate(results):
         if r.get("_t_in") is not None:
             anchors.append((i, r["_t_in"]))
-    anchors.append((len(results), total_dur or (
-        tc_s(edl_events[-1]["rec_out"]) if edl_events else 3600.0)))
+    anchors.append((len(results), total_dur or 3600.0))
 
     for idx, r in enumerate(results):
         if r.get("_t_in") is not None: continue
@@ -1033,6 +1165,9 @@ def match_three_input(script_lines, edl_events, audio_segments,
     n_miss   = sum(1 for r in results if "NOT FOUND" in r.get("_match_note",""))
     log_fn(f"Match: {n_conf} EDL-verified | {n_tilde} Whisper (~) | "
            f"{n_interp} estimated | {n_warn} wording ⚠ | {n_miss} NOT FOUND")
+
+    for r in results:
+        r.pop("_t_in", None)
     return results
 
 
@@ -1296,7 +1431,7 @@ def send_notify_email(user_name, script_name, video_name,
 # Background job runner
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_path, edl_path=None):
+def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_path, edl_path=None, csv_path=None):
     job = jobs[job_id]
 
     def log(msg, pct=None):
@@ -1312,7 +1447,27 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
         script_lines = parse_source_script(script_path)
         log(f"✓ Found {len(script_lines)} lines in script.", 15)
 
-        # 2 — Parse EDL if provided
+        # 2 — Premiere CSV fast path (most accurate)
+        if csv_path:
+            log("Premiere transcript CSV detected — using for timecodes…", 18)
+            csv_entries = parse_premiere_csv(csv_path, fps)
+            log(f"✓ {len(csv_entries)} transcript entries loaded", 30)
+            log("Matching script to transcript…", 70)
+            matched   = match_from_premiere_csv(script_lines, csv_entries, fps)
+            n_matched = sum(1 for m in matched if m.get("tc_in") and m.get("type")=="vo")
+            log(f"✓ {n_matched} VO lines timecoded from Premiere transcript", 88)
+            log("Building output spreadsheet…", 92)
+            build_output_xlsx(matched, output_path, fps)
+            log("✓ Done!", 100)
+            job["status"] = "done"; job["output_path"] = str(output_path)
+            send_notify_email(user_name=job.get("user_name",""),
+                script_name=job.get("script_name",""),
+                video_name=job.get("video_name",""),
+                n_matched=n_matched, n_total=len(matched),
+                status="done", error=None)
+            return
+
+        # 2b — Parse EDL if provided
         edl_events = []
         if edl_path:
             log("Parsing EDL…", 18)
@@ -1362,16 +1517,20 @@ def run_job(job_id, script_path, video_path, tc_offset, fps, api_key, output_pat
                 extract_channel(video_path, mp3_vo,   channel=1)
                 log(f"Dialogue: {mp3_dial.stat().st_size/1024/1024:.1f} MB  VO: {mp3_vo.stat().st_size/1024/1024:.1f} MB", 36)
                 log("Transcribing dialogue channel…", 38)
-                dial_segs = transcribe_openai(mp3_dial, api_key)
-                log(f"✓ Dialogue: {len(dial_segs)} segments", 52)
+                dial_r = transcribe_openai(mp3_dial, api_key)
+                log(f"✓ Dialogue: {len(dial_r['segments'])} segments", 52)
                 log("Transcribing VO channel…", 54)
-                vo_segs = transcribe_openai(mp3_vo, api_key)
-                log(f"✓ VO: {len(vo_segs)} segments", 68)
-                audio_segments = {"dial": dial_segs, "vo": vo_segs}
+                vo_r = transcribe_openai(mp3_vo, api_key)
+                log(f"✓ VO: {len(vo_r['segments'])} segments, {len(vo_r['words'])} words", 68)
+                audio_segments = {"dial": dial_r["segments"],
+                                  "vo_segs": vo_r["segments"],
+                                  "vo_words": vo_r["words"]}
             else:
                 log("Mono/mixed audio — transcribing…", 36)
-                audio_segments = transcribe_openai(mp3, api_key)
-                log(f"✓ {len(audio_segments)} segments", 68)
+                mono_r = transcribe_openai(mp3, api_key)
+                log(f"✓ {len(mono_r['segments'])} segments, {len(mono_r['words'])} words", 68)
+                audio_segments = {"vo_segs": mono_r["segments"],
+                                  "vo_words": mono_r["words"]}
         else:
             log("No audio file — using EDL only", 68)
 
@@ -1468,8 +1627,9 @@ def start_job():
     # Either a video/audio file OR an EDL must be provided
     has_audio = "video" in request.files and request.files["video"].filename
     has_edl   = "edl"   in request.files and request.files["edl"].filename
-    if not has_audio and not has_edl:
-        return jsonify({"error": "Please upload either an audio/video file or an EDL file."}), 400
+    has_csv   = "csv"   in request.files and request.files["csv"].filename
+    if not has_audio and not has_edl and not has_csv:
+        return jsonify({"error": "Please upload an audio file, EDL, or Premiere transcript CSV."}), 400
 
     script_file = request.files["script"]
     video_file  = request.files.get("video")
@@ -1502,6 +1662,11 @@ def start_job():
     if edl_file and edl_file.filename:
         edl_path = str(UPLOAD_DIR / f"{job_id}_edl{Path(edl_file.filename).suffix}")
         edl_file.save(edl_path)
+    csv_path = None
+    csv_file = request.files.get("csv")
+    if csv_file and csv_file.filename:
+        csv_path = str(UPLOAD_DIR / f"{job_id}_transcript.csv")
+        csv_file.save(csv_path)
     write_usage_log(user_name, script_file.filename,
                     (video_file.filename if video_file else edl_file.filename if edl_file else ""), "started")
 
@@ -1520,7 +1685,7 @@ def start_job():
         target=run_job,
         args=(job_id, str(script_path),
               str(video_path) if (video_file and video_file.filename) else None,
-              tc_offset, fps, api_key, output_path, edl_path),
+              tc_offset, fps, api_key, output_path, edl_path, csv_path),
         daemon=True
     )
     thread.start()
