@@ -922,209 +922,239 @@ def match_timecodes(script_lines, segments, tc_offset_secs, fps):
 def match_three_input(script_lines, edl_events, audio_segments,
                       tc_offset_secs, fps, log_fn=print):
     """
-    Word-level alignment matching.
+    Group-level matching.
 
-    The VO wav contains all VO lines spoken in programme order.
-    Whisper gives us word-level timestamps.
+    VO artists record multiple script lines as continuous takes.
+    Whisper sees these as single blocks of speech.
 
-    Algorithm:
-    1. Flatten Whisper words into a single ordered list
-    2. For each script VO line, find the best run of consecutive words
-       that matches the script text — starting from the current word cursor
-    3. TC In  = start time of the first matching word
-    4. TC Out = end time of the last matching word
-    5. Cursor advances past the matched words
+    Strategy:
+    1. Merge Whisper segments into speech BLOCKS (silence gap > 0.8s)
+    2. For each block, find the best matching GROUP of consecutive
+       script VO lines (sliding window up to 8 lines)
+    3. Assign TC In to first line, TC Out to last line of the group
+    4. Linearly interpolate TCs for lines in the middle
+    5. EDL cross-check: if EDL event is within 2s, use frame-accurate TC
 
-    This works even when Whisper groups multiple VO lines into one segment,
-    because we match at word granularity regardless of segment boundaries.
-
-    EDL cross-check: if an EDL event is within 2s of the word-match position,
-    use the frame-accurate EDL TC instead.
+    This works because it matches at the same granularity as the recording.
     """
     WORDING_THRESHOLD = 0.15
     EDL_VERIFY_SECS   = 2.0
+    SILENCE_GAP       = 0.8   # seconds gap = new speech block
+    MAX_GROUP         = 8     # max script lines per Whisper block
+    MATCH_THRESHOLD   = 0.25  # minimum score to accept a block match
 
     results = []
 
     # ── Unpack audio ───────────────────────────────────────────────────────
     if isinstance(audio_segments, dict):
-        vo_words = audio_segments.get("vo_words", [])
         vo_segs  = audio_segments.get("vo_segs",  audio_segments.get("vo", []))
+        vo_words = audio_segments.get("vo_words", [])
     elif isinstance(audio_segments, list):
-        vo_words = []
-        vo_segs  = audio_segments
+        vo_segs = audio_segments; vo_words = []
     else:
-        vo_words = []
-        vo_segs  = []
+        vo_segs = []; vo_words = []
 
-    # Fall back to segment midpoints if no words
-    if not vo_words and vo_segs:
-        for seg in vo_segs:
-            for w in seg["text"].split():
-                mid = (seg["start"] + seg["end"]) / 2
-                vo_words.append({"word": w, "start": seg["start"],
-                                 "end": seg["end"]})
+    total_dur = vo_segs[-1]["end"] if vo_segs else 0.0
 
-    n_words   = len(vo_words)
-    w_cursor  = 0
-    total_dur = vo_words[-1]["end"] if vo_words else (
-                vo_segs[-1]["end"] if vo_segs else 0.0)
+    # ── Merge segments into speech blocks ─────────────────────────────────
+    blocks = []
+    if vo_segs:
+        cur = {"start": vo_segs[0]["start"], "end": vo_segs[0]["end"],
+               "text": vo_segs[0]["text"].strip()}
+        for seg in vo_segs[1:]:
+            if seg["start"] - cur["end"] < SILENCE_GAP:
+                cur["end"]  = seg["end"]
+                cur["text"] = (cur["text"] + " " + seg["text"]).strip()
+            else:
+                blocks.append(cur)
+                cur = {"start": seg["start"], "end": seg["end"],
+                       "text": seg["text"].strip()}
+        blocks.append(cur)
+    log_fn(f"  {len(vo_segs)} segments → {len(blocks)} speech blocks")
 
-    log_fn(f"  Word-level alignment: {n_words} words available")
+    # ── Build word lookup for precise in/out within a block ───────────────
+    # word_list is sorted by start time
+    word_list = sorted(vo_words, key=lambda w: w["start"]) if vo_words else []
+
+    def words_in_range(t_start, t_end):
+        return [w for w in word_list
+                if w["start"] >= t_start - 0.1 and w["end"] <= t_end + 0.1]
 
     # ── EDL lookup ─────────────────────────────────────────────────────────
     def tc_s(tc):
-        p = tc.replace(";", ":").split(":")
-        return int(p[0])*3600 + int(p[1])*60 + int(p[2]) + int(p[3])/fps
+        p = tc.replace(";",":").split(":")
+        return int(p[0])*3600+int(p[1])*60+int(p[2])+int(p[3])/fps
 
-    edl_by_time = []
+    edl_sorted = []
     for ev in edl_events:
-        try:
-            edl_by_time.append((tc_s(ev["rec_in"]), tc_s(ev["rec_out"]), ev))
+        try: edl_sorted.append((tc_s(ev["rec_in"]), tc_s(ev["rec_out"]), ev))
         except: pass
-    edl_by_time.sort(key=lambda x: x[0])
+    edl_sorted.sort(key=lambda x: x[0])
     edl_used = set()
 
-    def find_edl_near(w_in):
+    def find_edl_near(t_in):
         best = None; best_diff = EDL_VERIFY_SECS + 1
-        for t_in, t_out, ev in edl_by_time:
+        for t_e_in, t_e_out, ev in edl_sorted:
             if id(ev) in edl_used: continue
-            diff = abs(t_in - w_in)
+            diff = abs(t_e_in - t_in)
             if diff <= EDL_VERIFY_SECS and diff < best_diff:
-                best_diff = diff; best = (t_in, t_out, ev)
+                best_diff = diff; best = (t_e_in, t_e_out, ev)
         return best
 
-    # ── Word-level search ──────────────────────────────────────────────────
-    def word_search(script_text, cursor):
-        """
-        Find the best matching run of words in vo_words starting from cursor.
-        Returns (score, start_idx, end_idx) or (0, None, None).
+    # ── Extract script VO lines in order ──────────────────────────────────
+    STOP = {'a','an','the','and','or','of','in','is','are','was','were',
+            'to','for','at','by','on','with','that','this','it','its',
+            'as','be','been','has','have','had'}
 
-        Strategy: extract key content words from script, find the window
-        of Whisper words with maximum overlap, allowing for paraphrasing.
-        """
-        if cursor >= n_words:
-            return 0.0, None, None
+    def key_words(text):
+        ws = [w for w in normalize(text).split()
+              if w not in STOP and len(w) > 2]
+        return ws if ws else normalize(text).split()
 
-        # Script words (normalised, stop-words removed)
-        STOP = {'a','an','the','and','or','of','in','is','are','was',
-                'were','to','for','at','by','on','with','that','this',
-                'it','its','as','be','been','has','have','had'}
-        script_norm  = normalize(script_text)
-        script_words = [w for w in script_norm.split()
-                        if w not in STOP and len(w) > 2]
-        if not script_words:
-            script_words = script_norm.split()
-        n_sw = len(script_words)
+    def score_group(vo_line_texts, block_text):
+        """Score how well a group of VO lines matches a Whisper block."""
+        combined   = " ".join(vo_line_texts)
+        norm_comb  = normalize(combined)
+        norm_block = normalize(block_text)
+        seq_score  = similarity(norm_comb, norm_block)
+        # Word overlap on key words
+        kw_script  = set(key_words(combined))
+        kw_block   = set(key_words(block_text))
+        if kw_script:
+            overlap = len(kw_script & kw_block) / len(kw_script)
+        else:
+            overlap = 0.0
+        return max(seq_score, overlap * 0.9)
 
-        if n_sw == 0:
-            return 0.0, None, None
+    # ── Build list of (index, line) for VO lines only ─────────────────────
+    vo_indices = [(i, line) for i, line in enumerate(script_lines)
+                  if line.get("type") == "vo" and line.get("text","").strip()]
 
-        # Window size: script word count × 3 (allow for Whisper paraphrase)
-        win_size   = max(n_sw * 3, 10)
-        search_end = min(cursor + 200, n_words)   # look ahead up to 200 words
+    # ── Match blocks to groups of VO lines ────────────────────────────────
+    # For each Whisper block, find the best consecutive group of VO lines
+    vo_ptr    = 0   # pointer into vo_indices
+    n_vo_lines = len(vo_indices)
+    # assignments: vo_index → (t_in, t_out, note)
+    assignments = {}
 
-        best_score = 0.0; best_si = best_ei = None
+    for blk in blocks:
+        if vo_ptr >= n_vo_lines:
+            break
 
-        for si in range(cursor, search_end):
-            for ei in range(si + max(n_sw - 2, 1),
-                            min(si + win_size, search_end) + 1):
-                window_text  = " ".join(vo_words[k]["word"]
-                                        for k in range(si, ei))
-                window_norm  = normalize(window_text)
-                window_words = set(w for w in window_norm.split()
-                                   if w not in STOP and len(w) > 2)
+        best_score = 0.0
+        best_group_size = 0
 
-                # Score = fraction of script key words found in window
-                matched = sum(1 for sw in script_words if sw in window_words)
-                score   = matched / n_sw if n_sw else 0
+        # Try groups of 1..MAX_GROUP lines starting from vo_ptr
+        for grp_size in range(1, min(MAX_GROUP + 1, n_vo_lines - vo_ptr + 1)):
+            texts = [vo_indices[vo_ptr + g][1]["text"]
+                     for g in range(grp_size)
+                     if vo_ptr + g < n_vo_lines]
+            sc = score_group(texts, blk["text"])
+            if sc > best_score:
+                best_score = sc; best_group_size = grp_size
 
-                # Boost with sequence similarity
-                seq_score = similarity(script_norm, window_norm)
-                score     = max(score, seq_score)
+        if best_score < MATCH_THRESHOLD:
+            # Block doesn't match well — skip it
+            continue
 
-                if score > best_score:
-                    best_score = score; best_si = si; best_ei = ei - 1
+        # Assign TCs to the matched group
+        grp_end  = min(vo_ptr + best_group_size, n_vo_lines)
+        grp_idxs = list(range(vo_ptr, grp_end))
+        n_grp    = len(grp_idxs)
 
-        return best_score, best_si, best_ei
+        # Try to find word-level positions for each line within the block
+        blk_words = words_in_range(blk["start"], blk["end"])
+        blk_dur   = blk["end"] - blk["start"]
 
-    # ── Main pass ─────────────────────────────────────────────────────────
-    edl_seq_idx = 0
+        for gi, vi in enumerate(grp_idxs):
+            line_idx, line = vo_indices[vi]
+            line_text = line["text"].strip()
 
-    for line in script_lines:
+            # Interpolate position within block if multiple lines
+            frac_in  = gi / n_grp
+            frac_out = (gi + 1) / n_grp
+            t_in     = blk["start"] + frac_in  * blk_dur
+            t_out    = blk["start"] + frac_out * blk_dur
+
+            # Refine with word-level timestamps if available
+            if blk_words:
+                kw = key_words(line_text)
+                matched_words = [w for w in blk_words
+                                 if normalize(w["word"]) in kw]
+                if matched_words:
+                    t_in  = matched_words[0]["start"]
+                    t_out = matched_words[-1]["end"]
+
+            # Wording check
+            note = ""
+            heard_words = [w for w in blk_words
+                           if w["start"] >= blk["start"] + frac_in * blk_dur - 0.5
+                           and w["end"]  <= blk["start"] + frac_out * blk_dur + 0.5]
+            if heard_words:
+                heard = " ".join(w["word"] for w in heard_words)
+                sim   = similarity(normalize(line_text), normalize(heard))
+                if sim < (1 - WORDING_THRESHOLD):
+                    s = line_text[:50] + ("..." if len(line_text) > 50 else "")
+                    h = heard[:50]     + ("..." if len(heard) > 50 else "")
+                    note = f"WORDING: script: {s!r} | audio: {h!r}"
+
+            # EDL cross-check on first line of group
+            if gi == 0:
+                edl_hit = find_edl_near(t_in)
+                if edl_hit:
+                    t_e_in, t_e_out, ev = edl_hit
+                    edl_used.add(id(ev))
+                    t_in  = t_e_in
+                    t_out = t_e_out if n_grp == 1 else t_out
+
+            assignments[line_idx] = (t_in, t_out, note)
+
+        vo_ptr = grp_end
+
+    # ── Build results ─────────────────────────────────────────────────────
+    for i, line in enumerate(script_lines):
         ltype = line.get("type", "act")
         text  = line.get("text", "").strip()
 
-        if ltype in ("section", "part", "coda") or not text:
-            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
-                            "_match_note": "", "_t_in": None})
-            continue
+        if ltype in ("section","part","coda") or not text:
+            results.append({**line, "tc_in":"","tc_out":"","dur":"",
+                            "_match_note":"","_t_in":None}); continue
         if ltype != "vo":
-            results.append({**line, "tc_in": "", "tc_out": "", "dur": "",
-                            "_match_note": "", "_t_in": None})
-            continue
+            results.append({**line, "tc_in":"","tc_out":"","dur":"",
+                            "_match_note":"","_t_in":None}); continue
 
-        tc_in = tc_out = dur = note = ""
-        t_in_raw = None
+        if i in assignments:
+            t_in, t_out, note = assignments[i]
 
-        if vo_words:
-            score, si, ei = word_search(text, w_cursor)
-
-            if score >= 0.40 and si is not None:
-                w_cursor = ei + 1
-                w_in  = vo_words[si]["start"]
-                w_out = vo_words[ei]["end"]
-
-                # Wording check
-                heard = " ".join(vo_words[k]["word"]
-                                 for k in range(si, ei+1))
-                sim = similarity(normalize(text), normalize(heard))
-                if sim < (1 - WORDING_THRESHOLD):
-                    s = text[:60] + ("..." if len(text) > 60 else "")
-                    h = heard[:60] + ("..." if len(heard) > 60 else "")
-                    note = f"WORDING: script: {s!r} | audio: {h!r}"
-
-                # EDL cross-check
-                edl_hit = find_edl_near(w_in)
-                if edl_hit:
-                    t_in_e, t_out_e, ev = edl_hit
-                    edl_used.add(id(ev))
-                    tc_in    = ev["rec_in"]
-                    tc_out   = ev["rec_out"]
-                    dur      = dur_str(max(t_out_e - t_in_e, 0))
-                    t_in_raw = t_in_e
-                else:
-                    tc_in    = "~" + seconds_to_tc(w_in,  tc_offset_secs, fps)
-                    tc_out   = "~" + seconds_to_tc(w_out, tc_offset_secs, fps)
-                    dur      = dur_str(w_out - w_in)
-                    t_in_raw = w_in
-            elif score >= 0.20 and si is not None:
-                # Low confidence — use TC but flag it
-                w_cursor = ei + 1
-                w_in  = vo_words[si]["start"]
-                w_out = vo_words[ei]["end"]
-                tc_in    = "~" + seconds_to_tc(w_in,  tc_offset_secs, fps)
-                tc_out   = "~" + seconds_to_tc(w_out, tc_offset_secs, fps)
-                dur      = dur_str(w_out - w_in)
-                t_in_raw = w_in
-                note     = "⚠ low-confidence match — check TC"
+            # Check if this came from EDL
+            edl_hit = find_edl_near(t_in)
+            if edl_hit and abs(edl_hit[0] - t_in) < 0.04:
+                tc_in  = edl_hit[2]["rec_in"]
+                tc_out = edl_hit[2]["rec_out"]
+                dur    = dur_str(max(edl_hit[1] - edl_hit[0], 0))
+                t_in_raw = edl_hit[0]
             else:
-                note = "NOT FOUND in audio"
+                tc_in    = "~" + seconds_to_tc(t_in,  tc_offset_secs, fps)
+                tc_out   = "~" + seconds_to_tc(t_out, tc_offset_secs, fps)
+                dur      = dur_str(max(t_out - t_in, 0))
+                t_in_raw = t_in
 
-        elif edl_events:
-            if edl_seq_idx < len(edl_events):
-                ev = edl_events[edl_seq_idx]; edl_seq_idx += 1
-                t_in_e = tc_s(ev["rec_in"]); t_out_e = tc_s(ev["rec_out"])
-                tc_in    = ev["rec_in"]; tc_out = ev["rec_out"]
-                dur      = dur_str(max(t_out_e - t_in_e, 0))
-                t_in_raw = t_in_e
-            else:
-                note = "NOT FOUND — EDL exhausted"
+            results.append({**line, "tc_in":tc_in, "tc_out":tc_out,
+                            "dur":dur, "_match_note":note, "_t_in":t_in_raw})
         else:
-            note = "NOT FOUND — no audio or EDL"
-
-        results.append({**line, "tc_in": tc_in, "tc_out": tc_out, "dur": dur,
-                        "_match_note": note, "_t_in": t_in_raw})
+            # Sequential EDL fallback
+            if edl_events and not vo_segs:
+                unmatched_edl = [(t,u,ev) for t,u,ev in edl_sorted
+                                 if id(ev) not in edl_used]
+                if unmatched_edl:
+                    t_e_in,t_e_out,ev = unmatched_edl[0]
+                    edl_used.add(id(ev))
+                    results.append({**line,
+                        "tc_in": ev["rec_in"], "tc_out": ev["rec_out"],
+                        "dur": dur_str(max(t_e_out-t_e_in,0)),
+                        "_match_note":"", "_t_in": t_e_in}); continue
+            results.append({**line, "tc_in":"","tc_out":"","dur":"",
+                            "_match_note":"NOT FOUND in audio","_t_in":None})
 
     # ── Interpolation ─────────────────────────────────────────────────────
     anchors = [(-1, 0.0)]
@@ -1137,20 +1167,19 @@ def match_three_input(script_lines, edl_events, audio_segments,
         if r.get("_t_in") is not None: continue
         if r.get("type") in ("section","part","coda"): continue
         if r.get("type") != "vo": continue
-        if "NOT FOUND" in r.get("_match_note", ""): continue
-
-        prev_a = anchors[0]; next_a = anchors[-1]
+        if "NOT FOUND" in r.get("_match_note",""): continue
+        prev_a=anchors[0]; next_a=anchors[-1]
         for a in anchors:
-            if a[0] < idx:   prev_a = a
-            elif a[0] > idx: next_a = a; break
-        prev_i, prev_t = prev_a; next_i, next_t = next_a
-        frac    = (idx - prev_i) / max(next_i - prev_i, 1)
-        est_in  = prev_t + frac * (next_t - prev_t)
-        est_out = min(est_in + 5.0, next_t)
+            if a[0]<idx:   prev_a=a
+            elif a[0]>idx: next_a=a; break
+        prev_i,prev_t=prev_a; next_i,next_t=next_a
+        frac=   (idx-prev_i)/max(next_i-prev_i,1)
+        est_in  = prev_t + frac*(next_t-prev_t)
+        est_out = min(est_in+5.0, next_t)
         results[idx].update({
-            "tc_in":       "~" + seconds_to_tc(est_in,  tc_offset_secs, fps),
-            "tc_out":      "~" + seconds_to_tc(est_out, tc_offset_secs, fps),
-            "dur":         dur_str(est_out - est_in),
+            "tc_in":       "~"+seconds_to_tc(est_in,  tc_offset_secs, fps),
+            "tc_out":      "~"+seconds_to_tc(est_out, tc_offset_secs, fps),
+            "dur":         dur_str(est_out-est_in),
             "_match_note": "⚠ TC estimated — check against cut",
             "_t_in":       est_in,
         })
@@ -1161,13 +1190,12 @@ def match_three_input(script_lines, edl_events, audio_segments,
                    and r.get("tc_in","").startswith("~")
                    and "estimated" not in r.get("_match_note",""))
     n_interp = sum(1 for r in results if "estimated" in r.get("_match_note",""))
-    n_warn   = sum(1 for r in results if "WORDING" in r.get("_match_note",""))
+    n_warn   = sum(1 for r in results if "WORDING"   in r.get("_match_note",""))
     n_miss   = sum(1 for r in results if "NOT FOUND" in r.get("_match_note",""))
     log_fn(f"Match: {n_conf} EDL-verified | {n_tilde} Whisper (~) | "
            f"{n_interp} estimated | {n_warn} wording ⚠ | {n_miss} NOT FOUND")
 
-    for r in results:
-        r.pop("_t_in", None)
+    for r in results: r.pop("_t_in", None)
     return results
 
 
